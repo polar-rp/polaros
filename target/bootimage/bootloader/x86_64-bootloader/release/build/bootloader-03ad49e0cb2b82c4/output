@@ -1,0 +1,7 @@
+cargo:rerun-if-changed=C:\Users\fabia\Desktop\code\Systemoperacyjny\Cargo.toml
+cargo:rustc-link-search=native=C:\Users\fabia\Desktop\code\Systemoperacyjny\target\bootimage\bootloader\x86_64-bootloader\release\build\bootloader-03ad49e0cb2b82c4\out
+cargo:rustc-link-lib=static=kernel_bin-systemoperacyjny
+cargo:rerun-if-env-changed=KERNEL
+cargo:rerun-if-env-changed=KERNEL_MANIFEST
+cargo:rerun-if-changed=C:\Users\fabia\Desktop\code\Systemoperacyjny\target\x86_64-unknown-none\debug\systemoperacyjny
+cargo:rerun-if-changed=build.rs

@@ -1,0 +1,36 @@
+
+# CopyCat Config
+
+# Specify folders or files to include
+# e.g. src/components/**
+# all files in src/components and subfolders will be included
+[INCLUDE]
+
+src/**
+prisma/schema.prisma
+package.json
+
+
+# Specify folders or files to exclude 
+# Use this section to add PROJECT-SPECIFIC ignore patterns:
+[IGNORE]
+
+.env*
+
+**/dist/**
+**/build/**
+**/out/**
+
+**/*.test.ts
+**/*.spec.ts
+coverage/**
+
+# Note: The following are ALWAYS ignored automatically:
+# - Version control (.git), dependencies (node_modules, vendor)
+# - Lock files (package-lock.json, yarn.lock, Cargo.lock, etc.)
+# - IDE files (.vscode, .idea, *.swp)
+# - OS files (.DS_Store, Thumbs.db, desktop.ini)
+# - Build outputs (.next, .nuxt, __pycache__, *.pyc)
+# - Logs (*.log), cache (.cache, .turbo), temp files
+# - Source maps (*.map), coverage, and database files (*.db, *.sqlite)
+
