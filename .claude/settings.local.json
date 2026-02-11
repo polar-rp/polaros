@@ -41,7 +41,10 @@
       "Bash(\"/c/Program Files/Oracle/VirtualBox/VBoxManage.exe\" discardstate \"Systemoperacyjny\")",
       "Bash(\"/c/Program Files/Oracle/VirtualBox/VBoxManage.exe\" storageattach \"Systemoperacyjny\" --storagectl \"IDE\" --port 0 --device 0 --medium none)",
       "Bash(\"/c/Program Files/Oracle/VirtualBox/VBoxManage.exe\" convertfromraw \"C:\\\\Users\\\\fabia\\\\Desktop\\\\code\\\\Systemoperacyjny\\\\target\\\\x86_64-myos\\\\debug\\\\bootimage-systemoperacyjny.bin\" \"C:\\\\Users\\\\fabia\\\\Desktop\\\\code\\\\Systemoperacyjny\\\\systemoperacyjny.vdi\" --format VDI)",
-      "Bash(\"/c/Program Files/Oracle/VirtualBox/VBoxManage.exe\" startvm \"Systemoperacyjny\")"
+      "Bash(\"/c/Program Files/Oracle/VirtualBox/VBoxManage.exe\" startvm \"Systemoperacyjny\")",
+      "Bash(powershell:*)",
+      "Bash(\"/c/Program Files/Oracle/VirtualBox/VBoxManage.exe\" modifyvm \"Systemoperacyjny\" --uart1 0x3F8 4 --uart-mode1 file \"C:\\\\Users\\\\fabia\\\\Desktop\\\\code\\\\Systemoperacyjny\\\\serial.log\")",
+      "Bash(find:*)"
     ]
   }
 }

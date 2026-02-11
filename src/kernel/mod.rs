@@ -5,3 +5,4 @@ pub mod timer;
 pub mod memory;
 pub mod task;
 pub mod syscall;
+pub mod elf;

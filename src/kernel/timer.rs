@@ -1,7 +1,7 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::InterruptStackFrame;
-
 use crate::kernel::pic::{InterruptIndex, PICS};
+use crate::kernel::task::context::switch_context;
 
 pub const TIMER_HZ: u32 = 100;
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -48,7 +48,61 @@ impl core::fmt::Write for FmtBuf {
     }
 }
 
+/// Naked interrupt handler for Timer.
+/// Saves context, calls rust handler, schedules, restores context.
+#[naked]
 pub extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        core::arch::asm!(
+            // 1. Save all GPRs (except RSP which is already saved by CPU)
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+
+            // 2. Call Rust handler to update ticks and ACK PIC
+            "call rust_timer_handler",
+
+            // 3. Call Scheduler to switch tasks (preemptive)
+            "call scheduler_schedule",
+
+            // 4. Restore all GPRs
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+
+            // 5. Return from interrupt
+            "iretq",
+            options(noreturn)
+        );
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_timer_handler() {
     let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Only update VGA text status bar when NOT in GUI mode
@@ -68,5 +122,25 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptSta
     unsafe {
         PICS.lock()
             .notify_end_of_interrupt(InterruptIndex::Timer.as_u8());
+    }
+}
+
+/// Preemptive scheduler entry point called from the timer interrupt handler.
+/// Uses try_lock to avoid deadlocks — if the scheduler is already locked
+/// (e.g., during yield_now or spawn), we simply skip this tick.
+#[no_mangle]
+pub extern "C" fn scheduler_schedule() {
+    use crate::kernel::task::SCHEDULER;
+
+    let switch = {
+        if let Some(mut sched) = SCHEDULER.try_lock() {
+            sched.schedule_preempt()
+        } else {
+            return; // scheduler busy, skip this tick
+        }
+    }; // lock dropped here — BEFORE context switch
+
+    if let Some((old_ctx, new_ctx)) = switch {
+        unsafe { switch_context(old_ctx, new_ctx); }
     }
 }

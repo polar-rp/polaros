@@ -31,6 +31,10 @@ pub fn next_id() -> u32 {
 pub fn run() -> ! {
     crate::serial_println!("[GUI] Initializing...");
 
+    // Switch to VGA Mode 13h (320x200x256)
+    framebuffer::set_mode_13h();
+    crate::serial_println!("[GUI] VGA Mode 13h set");
+
     // Load VGA palette
     palette::load_palette();
     crate::serial_println!("[GUI] Palette loaded");

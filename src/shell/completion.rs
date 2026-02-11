@@ -6,6 +6,7 @@ pub const COMMANDS: &[&str] = &[
     "help", "echo", "clear", "ls", "cat", "touch", "write", "rm",
     "mkdir", "cd", "pwd", "uptime", "info", "grep", "wc", "cp",
     "mv", "hexdump", "save", "load", "ps", "spawn", "kill", "exec",
+    "fatls", "env", "export", "head", "tail", "sort", "uniq", "keymap",
 ];
 
 pub fn tab_complete(input: &str, cwd: &[String]) -> (usize, Vec<String>) {

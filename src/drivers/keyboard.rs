@@ -1,7 +1,110 @@
-use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, KeyboardLayout,
+                   Keyboard, Modifiers, ScancodeSet1};
 use spin::Mutex;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 const BUF_SIZE: usize = 128;
+
+// ---- Layout selection ----
+
+/// Available keyboard layouts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LayoutId {
+    Us104 = 0,
+    Uk105 = 1,
+    De105 = 2,
+    Azerty = 3,
+    Dvorak = 4,
+    Colemak = 5,
+}
+
+static CURRENT_LAYOUT: AtomicU8 = AtomicU8::new(0); // default: US
+
+pub fn set_layout(layout: LayoutId) {
+    CURRENT_LAYOUT.store(layout as u8, Ordering::Relaxed);
+}
+
+pub fn current_layout() -> LayoutId {
+    match CURRENT_LAYOUT.load(Ordering::Relaxed) {
+        0 => LayoutId::Us104,
+        1 => LayoutId::Uk105,
+        2 => LayoutId::De105,
+        3 => LayoutId::Azerty,
+        4 => LayoutId::Dvorak,
+        5 => LayoutId::Colemak,
+        _ => LayoutId::Us104,
+    }
+}
+
+pub fn layout_name(id: LayoutId) -> &'static str {
+    match id {
+        LayoutId::Us104 => "us",
+        LayoutId::Uk105 => "uk",
+        LayoutId::De105 => "de",
+        LayoutId::Azerty => "fr",
+        LayoutId::Dvorak => "dvorak",
+        LayoutId::Colemak => "colemak",
+    }
+}
+
+pub fn layout_from_name(name: &str) -> Option<LayoutId> {
+    match name {
+        "us" => Some(LayoutId::Us104),
+        "uk" => Some(LayoutId::Uk105),
+        "de" => Some(LayoutId::De105),
+        "fr" | "azerty" => Some(LayoutId::Azerty),
+        "dvorak" => Some(LayoutId::Dvorak),
+        "colemak" => Some(LayoutId::Colemak),
+        _ => None,
+    }
+}
+
+/// Dynamic keyboard layout that delegates to the selected layout at runtime.
+/// Also fixes the Oem7 bug in US104 layout (scancode 0x2B not mapped).
+pub struct PolarLayout;
+
+impl KeyboardLayout for PolarLayout {
+    fn map_keycode(
+        &self,
+        keycode: KeyCode,
+        modifiers: &Modifiers,
+        handle_ctrl: HandleControl,
+    ) -> DecodedKey {
+        match current_layout() {
+            LayoutId::Us104 => {
+                // Fix: Us104Key doesn't handle Oem7 (scancode 0x2B = the \| key
+                // on ANSI keyboards). It only handles Oem5 (scancode 0x56, ISO extra key).
+                if keycode == KeyCode::Oem7 {
+                    if modifiers.is_shifted() {
+                        DecodedKey::Unicode('|')
+                    } else {
+                        DecodedKey::Unicode('\\')
+                    }
+                } else {
+                    layouts::Us104Key.map_keycode(keycode, modifiers, handle_ctrl)
+                }
+            }
+            LayoutId::Uk105 => {
+                layouts::Uk105Key.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::De105 => {
+                layouts::De105Key.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::Azerty => {
+                layouts::Azerty.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::Dvorak => {
+                layouts::Dvorak104Key.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::Colemak => {
+                layouts::Colemak.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+        }
+    }
+}
+
+// ---- Scancode buffer ----
 
 struct ScancodeBuffer {
     buf: [u8; BUF_SIZE],
@@ -43,13 +146,15 @@ impl ScancodeBuffer {
 static SCANCODE_QUEUE: Mutex<ScancodeBuffer> = Mutex::new(ScancodeBuffer::new());
 
 lazy_static::lazy_static! {
-    static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
+    static ref KEYBOARD: Mutex<Keyboard<PolarLayout, ScancodeSet1>> =
         Mutex::new(Keyboard::new(
             ScancodeSet1::new(),
-            layouts::Us104Key,
+            PolarLayout,
             HandleControl::Ignore,
         ));
 }
+
+// ---- Public API ----
 
 pub fn add_scancode(scancode: u8) {
     SCANCODE_QUEUE.lock().push(scancode);

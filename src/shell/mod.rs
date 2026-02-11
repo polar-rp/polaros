@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use crate::{print, println};
 use crate::drivers::keyboard;
 use crate::drivers::vga;
+use crate::fs::{FS, FileSystem};
 
 const MAX_LINE: usize = 256;
 const HISTORY_MAX: usize = 16;
@@ -85,8 +86,166 @@ pub fn run() {
             continue;
         }
         history.push(trimmed);
-        commands::execute(trimmed, &mut cwd);
+        execute_line(trimmed, &mut cwd);
     }
+}
+
+/// Execute a full command line with pipe, redirect, and env var support.
+pub fn execute_line(line: &str, cwd: &mut Vec<String>) {
+    // 1. Expand environment variables ($VAR, ${VAR})
+    let expanded = commands::expand_env_vars(line);
+    let line = expanded.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    // 2. Parse I/O redirections from the line
+    //    Supported: > file, >> file, < file
+    let (pipeline_str, redirect) = parse_redirections(line);
+
+    // 3. Split on pipe '|' and chain commands
+    let mut pipe_data: Option<String> = None;
+
+    // If we have input redirection, read the file as initial pipe data
+    if let Some(ref input_file) = redirect.input_file {
+        let fs = FS.lock();
+        match fs.read(cwd, input_file) {
+            Some(data) => {
+                pipe_data = Some(String::from(core::str::from_utf8(data).unwrap_or("")));
+            }
+            None => {
+                vga::set_color(vga::Color::LightRed, vga::Color::Black);
+                println!("Plik wejsciowy '{}' nie istnieje.", input_file);
+                vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+                return;
+            }
+        }
+    }
+
+    for part in pipeline_str.split('|') {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+
+        let (cmd, args) = match part.split_once(' ') {
+            Some((c, a)) => (c, a),
+            None => (part, ""),
+        };
+
+        let output = commands::run_command(cmd, args, cwd, pipe_data.as_deref());
+        pipe_data = Some(output);
+    }
+
+    // 4. Handle output
+    if let Some(output) = pipe_data {
+        match redirect.output_mode {
+            OutputMode::Print => {
+                if !output.is_empty() {
+                    println!("{}", output);
+                }
+            }
+            OutputMode::Write(ref filename) => {
+                let mut fs = FS.lock();
+                if fs.write(cwd, filename, output.as_bytes()) {
+                    println!("Zapisano do '{}'.", filename);
+                } else {
+                    vga::set_color(vga::Color::LightRed, vga::Color::Black);
+                    println!("Nie mozna zapisac do '{}'.", filename);
+                    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+                }
+            }
+            OutputMode::Append(ref filename) => {
+                let mut fs = FS.lock();
+                // Read existing content, append new output
+                let mut existing = match fs.read(cwd, filename) {
+                    Some(data) => Vec::from(data),
+                    None => Vec::new(),
+                };
+                if !existing.is_empty() && existing.last() != Some(&b'\n') {
+                    existing.push(b'\n');
+                }
+                existing.extend_from_slice(output.as_bytes());
+                if fs.write(cwd, filename, &existing) {
+                    println!("Dopisano do '{}'.", filename);
+                } else {
+                    vga::set_color(vga::Color::LightRed, vga::Color::Black);
+                    println!("Nie mozna dopisac do '{}'.", filename);
+                    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+                }
+            }
+        }
+    }
+}
+
+enum OutputMode {
+    Print,
+    Write(String),
+    Append(String),
+}
+
+struct Redirect {
+    input_file: Option<String>,
+    output_mode: OutputMode,
+}
+
+fn parse_redirections(line: &str) -> (&str, Redirect) {
+    let mut redirect = Redirect {
+        input_file: None,
+        output_mode: OutputMode::Print,
+    };
+
+    // Find the last occurrence of redirect operators (not inside pipes)
+    // We search from the end of the line for >, >>, <
+    // Simple approach: find the last pipe segment and check for redirects there
+
+    // Find output redirect: >> or >
+    if let Some(pos) = line.rfind(">>") {
+        let filename = line[pos + 2..].trim();
+        if !filename.is_empty() && !filename.contains('|') {
+            let before = &line[..pos];
+            redirect.output_mode = OutputMode::Append(String::from(filename));
+
+            // Check for input redirect in the remaining part
+            if let Some(ipos) = before.rfind('<') {
+                let input_name = before[ipos + 1..].trim();
+                if !input_name.is_empty() {
+                    redirect.input_file = Some(String::from(input_name));
+                    return (&before[..ipos], redirect);
+                }
+            }
+            return (before, redirect);
+        }
+    }
+
+    if let Some(pos) = line.rfind('>') {
+        // Make sure it's not >>
+        if pos == 0 || line.as_bytes()[pos - 1] != b'>' {
+            let filename = line[pos + 1..].trim();
+            if !filename.is_empty() && !filename.contains('|') {
+                let before = &line[..pos];
+                redirect.output_mode = OutputMode::Write(String::from(filename));
+
+                if let Some(ipos) = before.rfind('<') {
+                    let input_name = before[ipos + 1..].trim();
+                    if !input_name.is_empty() {
+                        redirect.input_file = Some(String::from(input_name));
+                        return (&before[..ipos], redirect);
+                    }
+                }
+                return (before, redirect);
+            }
+        }
+    }
+
+    // Check for input redirect only
+    if let Some(pos) = line.rfind('<') {
+        let input_name = line[pos + 1..].trim();
+        if !input_name.is_empty() && !input_name.contains('|') && !input_name.contains('>') {
+            redirect.input_file = Some(String::from(input_name));
+            return (&line[..pos], redirect);
+        }
+    }
+
+    (line, redirect)
 }
 
 fn print_banner() {

@@ -93,17 +93,79 @@ impl TerminalWidget {
             return;
         }
 
-        // Split on pipe and chain commands
+        // Expand environment variables
+        let expanded = crate::shell::commands::expand_env_vars(trimmed);
+        let trimmed = expanded.trim();
+
+        // Parse redirections
+        let (pipeline_str, redir_out, redir_append, redir_in) = self.parse_redirections(trimmed);
+
+        // Handle input redirection
         let mut pipe_data: Option<String> = None;
-        for part in trimmed.split('|') {
+        if let Some(ref input_file) = redir_in {
+            use crate::fs::{FS, FileSystem};
+            let fs = FS.lock();
+            match fs.read(&self.cwd, input_file) {
+                Some(data) => {
+                    pipe_data = Some(String::from(core::str::from_utf8(data).unwrap_or("")));
+                }
+                None => {
+                    self.push_line(&format!("Plik '{}' nie istnieje.", input_file));
+                    return;
+                }
+            }
+        }
+
+        // Split on pipe and chain commands
+        for part in pipeline_str.split('|') {
             let part = part.trim();
             if part.is_empty() { continue; }
-            let output = self.run_command(part, pipe_data.as_deref());
+
+            let (cmd, args) = match part.split_once(' ') {
+                Some((c, a)) => (c, a),
+                None => (part, ""),
+            };
+
+            // Handle clear specially in GUI
+            if cmd == "clear" {
+                self.lines.clear();
+                pipe_data = Some(String::new());
+                continue;
+            }
+
+            let output = crate::shell::commands::run_command(
+                cmd, args, &mut self.cwd, pipe_data.as_deref()
+            );
             pipe_data = Some(output);
         }
 
+        // Handle output
         if let Some(output) = pipe_data {
-            if !output.is_empty() {
+            if let Some(ref filename) = redir_out {
+                use crate::fs::{FS, FileSystem};
+                let mut fs = FS.lock();
+                if fs.write(&self.cwd, filename, output.as_bytes()) {
+                    self.push_line(&format!("Zapisano do '{}'.", filename));
+                } else {
+                    self.push_line(&format!("Nie mozna zapisac do '{}'.", filename));
+                }
+            } else if let Some(ref filename) = redir_append {
+                use crate::fs::{FS, FileSystem};
+                let mut fs = FS.lock();
+                let mut existing = match fs.read(&self.cwd, filename) {
+                    Some(data) => Vec::from(data),
+                    None => Vec::new(),
+                };
+                if !existing.is_empty() && existing.last() != Some(&b'\n') {
+                    existing.push(b'\n');
+                }
+                existing.extend_from_slice(output.as_bytes());
+                if fs.write(&self.cwd, filename, &existing) {
+                    self.push_line(&format!("Dopisano do '{}'.", filename));
+                } else {
+                    self.push_line(&format!("Nie mozna dopisac do '{}'.", filename));
+                }
+            } else if !output.is_empty() {
                 for line in output.lines() {
                     self.push_line(line);
                 }
@@ -111,291 +173,40 @@ impl TerminalWidget {
         }
     }
 
-    fn run_command(&mut self, line: &str, pipe_input: Option<&str>) -> String {
-        let (cmd, args) = match line.split_once(' ') {
-            Some((c, a)) => (c, a),
-            None => (line, ""),
-        };
+    fn parse_redirections<'a>(&self, line: &'a str) -> (&'a str, Option<String>, Option<String>, Option<String>) {
+        // Returns (pipeline_str, write_file, append_file, input_file)
+        let mut write_file = None;
+        let mut append_file = None;
+        let mut input_file = None;
+        let mut pipeline_end = line.len();
 
-        match cmd {
-            "help" => self.cmd_help(),
-            "echo" => String::from(args),
-            "clear" => {
-                self.lines.clear();
-                String::new()
+        // Check for >>
+        if let Some(pos) = line.rfind(">>") {
+            let filename = line[pos + 2..].trim();
+            if !filename.is_empty() && !filename.contains('|') {
+                append_file = Some(String::from(filename));
+                pipeline_end = pos;
             }
-            "ls" => self.cmd_ls(),
-            "cat" => self.cmd_cat(args),
-            "touch" => self.cmd_touch(args),
-            "write" => self.cmd_write(args),
-            "rm" => self.cmd_rm(args),
-            "mkdir" => self.cmd_mkdir(args),
-            "cd" => { self.cmd_cd(args); String::new() }
-            "pwd" => self.cmd_pwd(),
-            "uptime" => self.cmd_uptime(),
-            "info" => self.cmd_info(),
-            "ps" => self.cmd_ps(),
-            "grep" => self.cmd_grep(args, pipe_input),
-            "wc" => self.cmd_wc(args, pipe_input),
-            _ => format!("Nieznana komenda: '{}'. Wpisz 'help'.", cmd),
-        }
-    }
-
-    fn cmd_help(&self) -> String {
-        let mut s = String::new();
-        s.push_str("Dostepne komendy:\n");
-        s.push_str("  help      - Pomoc\n");
-        s.push_str("  echo <t>  - Wyswietl tekst\n");
-        s.push_str("  clear     - Wyczysc terminal\n");
-        s.push_str("  ls        - Lista plikow\n");
-        s.push_str("  cat <f>   - Pokaz plik\n");
-        s.push_str("  touch <f> - Utworz plik\n");
-        s.push_str("  write <f> <t> - Zapisz\n");
-        s.push_str("  rm <n>    - Usun\n");
-        s.push_str("  mkdir <n> - Nowy katalog\n");
-        s.push_str("  cd <d>    - Zmien katalog\n");
-        s.push_str("  pwd       - Biezacy katalog\n");
-        s.push_str("  uptime    - Czas dzialania\n");
-        s.push_str("  info      - Info systemowe\n");
-        s.push_str("  ps        - Lista taskow\n");
-        s.push_str("  grep <w> [f] - Szukaj wzorca\n");
-        s.push_str("  wc [plik] - Policz linie/slowa\n");
-        s.push_str("Pipe: cmd1 | cmd2");
-        s
-    }
-
-    fn cmd_ls(&self) -> String {
-        use crate::fs::{FS, FileSystem};
-        let fs = FS.lock();
-        match fs.list(&self.cwd) {
-            Some(entries) => {
-                if entries.is_empty() {
-                    return String::from("(pusty katalog)");
-                }
-                let mut s = String::new();
-                for entry in &entries {
-                    if entry.is_dir {
-                        s.push_str("  ");
-                        s.push_str(&entry.name);
-                        s.push_str("/\n");
-                    } else {
-                        s.push_str(&format!("  {} ({} B)\n", entry.name, entry.size));
-                    }
-                }
-                if s.ends_with('\n') { s.pop(); }
-                s
-            }
-            None => String::from("Katalog nie istnieje."),
-        }
-    }
-
-    fn cmd_cat(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: cat <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(&self.cwd, name) {
-            Some(data) => {
-                String::from(core::str::from_utf8(data).unwrap_or("<dane binarne>"))
-            }
-            None => format!("Plik '{}' nie istnieje.", name),
-        }
-    }
-
-    fn cmd_touch(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: touch <plik>"),
-        };
-        let mut fs = FS.lock();
-        if fs.create(&self.cwd, name) {
-            format!("Utworzono '{}'.", name)
-        } else {
-            format!("'{}' juz istnieje.", name)
-        }
-    }
-
-    fn cmd_write(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let (name, content) = match args.split_once(' ') {
-            Some((n, c)) => (n, c),
-            None => return String::from("Uzycie: write <plik> <tekst>"),
-        };
-        let mut fs = FS.lock();
-        if fs.write(&self.cwd, name, content.as_bytes()) {
-            format!("Zapisano {} B do '{}'.", content.len(), name)
-        } else {
-            format!("Nie mozna zapisac do '{}'.", name)
-        }
-    }
-
-    fn cmd_rm(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem, RemoveResult};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: rm <nazwa>"),
-        };
-        let mut fs = FS.lock();
-        match fs.remove(&self.cwd, name) {
-            RemoveResult::Ok => format!("Usunieto '{}'.", name),
-            RemoveResult::NotFound => format!("'{}' nie istnieje.", name),
-            RemoveResult::DirNotEmpty => format!("Katalog '{}' nie jest pusty.", name),
-        }
-    }
-
-    fn cmd_mkdir(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: mkdir <nazwa>"),
-        };
-        let mut fs = FS.lock();
-        if fs.mkdir(&self.cwd, name) {
-            format!("Utworzono katalog '{}'.", name)
-        } else {
-            format!("'{}' juz istnieje.", name)
-        }
-    }
-
-    fn cmd_cd(&mut self, args: &str) {
-        use crate::fs::{FS, FileSystem};
-        let target = match args.split_whitespace().next() {
-            Some(t) => t,
-            None => { self.cwd.clear(); return; }
-        };
-        match target {
-            "/" => self.cwd.clear(),
-            ".." => { self.cwd.pop(); }
-            "." => {}
-            name => {
-                let (exists, is_dir) = {
-                    let fs = FS.lock();
-                    (fs.exists(&self.cwd, name), fs.is_dir(&self.cwd, name))
-                };
-                if !exists {
-                    self.push_line(&format!("'{}' nie istnieje.", name));
-                } else if is_dir {
-                    self.cwd.push(String::from(name));
-                } else {
-                    self.push_line(&format!("'{}' nie jest katalogiem.", name));
-                }
+        } else if let Some(pos) = line.rfind('>') {
+            let filename = line[pos + 1..].trim();
+            if !filename.is_empty() && !filename.contains('|') {
+                write_file = Some(String::from(filename));
+                pipeline_end = pos;
             }
         }
-    }
 
-    fn cmd_pwd(&self) -> String {
-        if self.cwd.is_empty() {
-            String::from("/")
-        } else {
-            let mut s = String::new();
-            for c in &self.cwd {
-                s.push('/');
-                s.push_str(c);
-            }
-            s
-        }
-    }
+        let remaining = &line[..pipeline_end];
 
-    fn cmd_uptime(&self) -> String {
-        let t = crate::kernel::timer::ticks();
-        let hz = crate::kernel::timer::TIMER_HZ as u64;
-        let total_secs = t / hz;
-        let h = total_secs / 3600;
-        let m = (total_secs % 3600) / 60;
-        let s = total_secs % 60;
-        format!("Uptime: {}h {:02}m {:02}s ({} tickow)", h, m, s, t)
-    }
-
-    fn cmd_info(&self) -> String {
-        let (heap_used, heap_free) = crate::kernel::memory::heap::heap_stats();
-        let total_kb = (heap_used + heap_free) / 1024;
-        let used_kb = heap_used / 1024;
-        let mut s = String::new();
-        s.push_str("=== Info systemowe ===\n");
-        s.push_str("  System:    PolarOs v0.1.0\n");
-        s.push_str("  Arch:      x86_64\n");
-        s.push_str("  Tryb:      VGA 320x200 256c\n");
-        s.push_str(&format!("  Heap:      {}/{} KiB", used_kb, total_kb));
-        s
-    }
-
-    fn cmd_grep(&self, args: &str, pipe_input: Option<&str>) -> String {
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        let pattern = match parts.first() {
-            Some(p) => *p,
-            None => return String::from("Uzycie: grep <wzorzec> [plik]"),
-        };
-
-        let text = if let Some(input) = pipe_input {
-            String::from(input)
-        } else {
-            use crate::fs::{FS, FileSystem};
-            let filename = match parts.get(1) {
-                Some(f) => *f,
-                None => return String::from("Uzycie: grep <wzorzec> <plik>"),
-            };
-            let fs = FS.lock();
-            match fs.read(&self.cwd, filename) {
-                Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-                None => return format!("Plik '{}' nie istnieje.", filename),
-            }
-        };
-
-        let mut result = String::new();
-        for line in text.lines() {
-            if line.contains(pattern) {
-                result.push_str(line);
-                result.push('\n');
+        // Check for <
+        if let Some(pos) = remaining.rfind('<') {
+            let filename = remaining[pos + 1..].trim();
+            if !filename.is_empty() {
+                input_file = Some(String::from(filename));
+                return (&remaining[..pos], write_file, append_file, input_file);
             }
         }
-        if result.ends_with('\n') { result.pop(); }
-        if result.is_empty() {
-            format!("Brak wynikow dla '{}'.", pattern)
-        } else {
-            result
-        }
-    }
 
-    fn cmd_wc(&self, args: &str, pipe_input: Option<&str>) -> String {
-        let text = if let Some(input) = pipe_input {
-            String::from(input)
-        } else {
-            use crate::fs::{FS, FileSystem};
-            let name = match args.split_whitespace().next() {
-                Some(n) => n,
-                None => return String::from("Uzycie: wc <plik>"),
-            };
-            let fs = FS.lock();
-            match fs.read(&self.cwd, name) {
-                Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-                None => return format!("Plik '{}' nie istnieje.", name),
-            }
-        };
-
-        let bytes = text.len();
-        let lines = text.lines().count();
-        let words = text.split_whitespace().count();
-        format!("  {} linii  {} slow  {} bajtow", lines, words, bytes)
-    }
-
-    fn cmd_ps(&self) -> String {
-        use crate::kernel::task::{SCHEDULER, TaskState};
-        let mut s = String::new();
-        s.push_str("  ID  STAN        NAZWA\n");
-        let sched = SCHEDULER.lock();
-        for task in sched.task_list() {
-            let state_str = match task.state {
-                TaskState::Ready => "Ready     ",
-                TaskState::Running => "Running   ",
-                TaskState::Terminated => "Terminated",
-            };
-            s.push_str(&format!("  {:3} {} {}\n", task.id.0, state_str, task.name));
-        }
-        if s.ends_with('\n') { s.pop(); }
-        s
+        (remaining, write_file, append_file, input_file)
     }
 }
 

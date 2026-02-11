@@ -1,4 +1,5 @@
 src/drivers/ata.rs
+
 ```rust
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::instructions::port::Port;
@@ -131,6 +132,7 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> bool {
 ```
 
 src/drivers/keyboard.rs
+
 ```rust
 use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
 use spin::Mutex;
@@ -253,6 +255,7 @@ pub fn read_key() -> KeyEvent {
 ```
 
 src/drivers/mod.rs
+
 ```rust
 pub mod vga;
 pub mod serial;
@@ -263,6 +266,7 @@ pub mod mouse;
 ```
 
 src/drivers/mouse.rs
+
 ```rust
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -449,6 +453,7 @@ pub fn handle_byte(byte: u8) {
 ```
 
 src/drivers/serial.rs
+
 ```rust
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -494,6 +499,7 @@ macro_rules! serial_println {
 ```
 
 src/drivers/vga.rs
+
 ```rust
 use core::fmt;
 use lazy_static::lazy_static;
@@ -720,6 +726,7 @@ pub fn update_status_bar(left: &str, right: &str) {
 ```
 
 src/fs/mod.rs
+
 ```rust
 pub mod ramfs;
 
@@ -769,6 +776,7 @@ pub fn init() {
 ```
 
 src/fs/ramfs.rs
+
 ```rust
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -991,6 +999,7 @@ impl FileSystem for RamFs {
 ```
 
 src/gui/compositor.rs
+
 ```rust
 use alloc::vec::Vec;
 use alloc::boxed::Box;
@@ -1153,6 +1162,7 @@ impl Compositor {
 ```
 
 src/gui/cursor.rs
+
 ```rust
 use super::framebuffer::Framebuffer;
 
@@ -1229,6 +1239,7 @@ impl Cursor {
 ```
 
 src/gui/event.rs
+
 ```rust
 use spin::Mutex;
 
@@ -1308,6 +1319,7 @@ pub static EVENT_QUEUE: Mutex<EventQueue> = Mutex::new(EventQueue::new());
 ```
 
 src/gui/font.rs
+
 ```rust
 use super::framebuffer::Framebuffer;
 use font8x8::legacy::BASIC_LEGACY;
@@ -1360,13 +1372,14 @@ pub fn draw_text_bg(fb: &mut Framebuffer, x: i16, y: i16, text: &str, fg: u8, bg
     }
 }
 
-pub fn text_width(text: &str) -> u16 {
+pub fn text_width(text: &str) -> u16 {24-bit True Color (16,7 miliona kolorów) + 8-bit alpha
     text.len() as u16 * CHAR_WIDTH
 }
 
 ```
 
 src/gui/framebuffer.rs
+
 ```rust
 use alloc::boxed::Box;
 
@@ -1431,6 +1444,7 @@ impl Framebuffer {
 ```
 
 src/gui/mod.rs
+
 ```rust
 pub mod framebuffer;
 pub mod primitives;
@@ -1567,6 +1581,7 @@ fn spawn_terminal_window(compositor: &mut Compositor, theme: &Theme) {
 ```
 
 src/gui/palette.rs
+
 ```rust
 use x86_64::instructions::port::Port;
 
@@ -1675,6 +1690,7 @@ pub fn load_palette() {
 ```
 
 src/gui/primitives.rs
+
 ```rust
 use super::framebuffer::Framebuffer;
 
@@ -1734,6 +1750,7 @@ pub fn draw_line(fb: &mut Framebuffer, x0: i16, y0: i16, x1: i16, y1: i16, color
 ```
 
 src/gui/theme.rs
+
 ```rust
 use super::palette;
 
@@ -1786,6 +1803,7 @@ pub fn default_dark_theme() -> Theme {
 ```
 
 src/gui/wallpaper.rs
+
 ```rust
 use alloc::vec::Vec;
 
@@ -2040,6 +2058,7 @@ pub fn render_wallpaper(width: u16, height: u16, bg_color: u8, logo_color: u8) -
 ```
 
 src/gui/widget/button.rs
+
 ```rust
 use alloc::string::String;
 use super::{Widget, Rect, EventResponse};
@@ -2148,6 +2167,7 @@ impl Widget for Button {
 ```
 
 src/gui/widget/desktop.rs
+
 ```rust
 use alloc::vec::Vec;
 use super::{Widget, Rect, EventResponse};
@@ -2279,6 +2299,7 @@ fn format_time<'a>(buf: &'a mut [u8; 16], h: u64, m: u64, s: u64) -> &'a str {
 ```
 
 src/gui/widget/label.rs
+
 ```rust
 use alloc::string::String;
 use super::{Widget, Rect, EventResponse};
@@ -2336,6 +2357,7 @@ impl Widget for Label {
 ```
 
 src/gui/widget/mod.rs
+
 ```rust
 pub mod desktop;
 pub mod window;
@@ -2390,6 +2412,7 @@ pub trait Widget {
 ```
 
 src/gui/widget/panel.rs
+
 ```rust
 use alloc::vec::Vec;
 use alloc::boxed::Box;
@@ -2474,6 +2497,7 @@ impl Widget for Panel {
 ```
 
 src/gui/widget/terminal.rs
+
 ```rust
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -2983,6 +3007,7 @@ impl Widget for TerminalWidget {
 ```
 
 src/gui/widget/window.rs
+
 ```rust
 use alloc::string::String;
 use alloc::boxed::Box;
@@ -3140,6 +3165,7 @@ impl Widget for Window {
 ```
 
 src/kernel/gdt.rs
+
 ```rust
 use lazy_static::lazy_static;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
@@ -3209,6 +3235,7 @@ pub fn init() {
 ```
 
 src/kernel/idt.rs
+
 ```rust
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -3300,6 +3327,7 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
 ```
 
 src/kernel/memory/frame_allocator.rs
+
 ```rust
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use x86_64::{
@@ -3346,6 +3374,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 ```
 
 src/kernel/memory/heap.rs
+
 ```rust
 use linked_list_allocator::LockedHeap;
 use x86_64::{
@@ -3398,6 +3427,7 @@ pub fn heap_stats() -> (usize, usize) {
 ```
 
 src/kernel/memory/mod.rs
+
 ```rust
 pub mod paging;
 pub mod frame_allocator;
@@ -3406,6 +3436,7 @@ pub mod heap;
 ```
 
 src/kernel/memory/paging.rs
+
 ```rust
 use x86_64::{
     structures::paging::{OffsetPageTable, PageTable},
@@ -3432,6 +3463,7 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 ```
 
 src/kernel/mod.rs
+
 ```rust
 pub mod gdt;
 pub mod idt;
@@ -3444,6 +3476,7 @@ pub mod syscall;
 ```
 
 src/kernel/pic.rs
+
 ```rust
 use pic8259::ChainedPics;
 use spin;
@@ -3475,6 +3508,7 @@ impl InterruptIndex {
 ```
 
 src/kernel/syscall/handlers.rs
+
 ```rust
 use crate::kernel::task;
 
@@ -3551,6 +3585,7 @@ fn sys_getpid() -> u64 {
 ```
 
 src/kernel/syscall/mod.rs
+
 ```rust
 pub mod handlers;
 pub mod userprogs;
@@ -3630,6 +3665,7 @@ unsafe extern "C" fn syscall_entry_asm() {
 ```
 
 src/kernel/syscall/userprogs.rs
+
 ```rust
 /// Pre-compiled user-mode programs (raw x86_64 machine code).
 /// These use the syscall instruction to communicate with the kernel.
@@ -3756,6 +3792,7 @@ pub fn run_user_counter() {
 ```
 
 src/kernel/task/context.rs
+
 ```rust
 /// CPU context for cooperative task switching.
 /// Only callee-saved registers need to be preserved across function calls.
@@ -3826,6 +3863,7 @@ pub unsafe extern "C" fn switch_context(old: *mut Context, new: *const Context) 
 ```
 
 src/kernel/task/mod.rs
+
 ```rust
 pub mod context;
 pub mod scheduler;
@@ -3835,6 +3873,7 @@ pub use scheduler::{yield_now, spawn, exit_current_task, TaskId, TaskState, SCHE
 ```
 
 src/kernel/task/scheduler.rs
+
 ```rust
 use alloc::vec::Vec;
 use alloc::boxed::Box;
@@ -4062,6 +4101,7 @@ pub fn spawn(name: &'static str, entry_fn: fn()) -> TaskId {
 ```
 
 src/kernel/timer.rs
+
 ```rust
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::InterruptStackFrame;
@@ -4139,6 +4179,7 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptSta
 ```
 
 src/lib.rs
+
 ```rust
 #![no_std]
 #![feature(abi_x86_interrupt)]
@@ -4177,6 +4218,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ```
 
 src/main.rs
+
 ```rust
 #![no_std]
 #![no_main]
@@ -4211,6 +4253,7 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
 ```
 
 src/shell/commands.rs
+
 ```rust
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -4843,6 +4886,7 @@ fn cmd_exec(args: &str) {
 ```
 
 src/shell/completion.rs
+
 ```rust
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -4892,6 +4936,7 @@ pub fn common_prefix(strings: &[String]) -> String {
 ```
 
 src/shell/mod.rs
+
 ```rust
 pub mod commands;
 pub mod completion;
@@ -5080,4 +5125,3 @@ fn read_line(history: &mut CommandHistory, cwd: &[String]) -> String {
 }
 
 ```
-

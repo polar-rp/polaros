@@ -1,4 +1,5 @@
 pub mod ramfs;
+pub mod fat;
 
 use alloc::string::String;
 use alloc::vec::Vec;
