@@ -1,8 +1,0 @@
-C:\Users\fabia\Desktop\code\Systemoperacyjny\target\x86_64-myos\debug\deps\libvolatile-6cd4a38ef88c5ea5.rmeta: C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\lib.rs C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\access.rs
-
-C:\Users\fabia\Desktop\code\Systemoperacyjny\target\x86_64-myos\debug\deps\libvolatile-6cd4a38ef88c5ea5.rlib: C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\lib.rs C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\access.rs
-
-C:\Users\fabia\Desktop\code\Systemoperacyjny\target\x86_64-myos\debug\deps\volatile-6cd4a38ef88c5ea5.d: C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\lib.rs C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\access.rs
-
-C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\lib.rs:
-C:\Users\fabia\.cargo\registry\src\index.crates.io-6f17d22bba15001f\volatile-0.4.6\src\access.rs:
