@@ -1,5 +1,4 @@
 src/drivers/ata.rs
-
 ```rust
 use core::sync::atomic::{AtomicBool, Ordering};
 use x86_64::instructions::port::Port;
@@ -132,12 +131,114 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> bool {
 ```
 
 src/drivers/keyboard.rs
-
 ```rust
-use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, Keyboard, ScancodeSet1};
+use pc_keyboard::{layouts, DecodedKey, HandleControl, KeyCode, KeyboardLayout,
+                   Keyboard, Modifiers, ScancodeSet1};
 use spin::Mutex;
+use core::sync::atomic::{AtomicU8, Ordering};
 
 const BUF_SIZE: usize = 128;
+
+// ---- Layout selection ----
+
+/// Available keyboard layouts
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum LayoutId {
+    Us104 = 0,
+    Uk105 = 1,
+    De105 = 2,
+    Azerty = 3,
+    Dvorak = 4,
+    Colemak = 5,
+}
+
+static CURRENT_LAYOUT: AtomicU8 = AtomicU8::new(0); // default: US
+
+pub fn set_layout(layout: LayoutId) {
+    CURRENT_LAYOUT.store(layout as u8, Ordering::Relaxed);
+}
+
+pub fn current_layout() -> LayoutId {
+    match CURRENT_LAYOUT.load(Ordering::Relaxed) {
+        0 => LayoutId::Us104,
+        1 => LayoutId::Uk105,
+        2 => LayoutId::De105,
+        3 => LayoutId::Azerty,
+        4 => LayoutId::Dvorak,
+        5 => LayoutId::Colemak,
+        _ => LayoutId::Us104,
+    }
+}
+
+pub fn layout_name(id: LayoutId) -> &'static str {
+    match id {
+        LayoutId::Us104 => "us",
+        LayoutId::Uk105 => "uk",
+        LayoutId::De105 => "de",
+        LayoutId::Azerty => "fr",
+        LayoutId::Dvorak => "dvorak",
+        LayoutId::Colemak => "colemak",
+    }
+}
+
+pub fn layout_from_name(name: &str) -> Option<LayoutId> {
+    match name {
+        "us" => Some(LayoutId::Us104),
+        "uk" => Some(LayoutId::Uk105),
+        "de" => Some(LayoutId::De105),
+        "fr" | "azerty" => Some(LayoutId::Azerty),
+        "dvorak" => Some(LayoutId::Dvorak),
+        "colemak" => Some(LayoutId::Colemak),
+        _ => None,
+    }
+}
+
+/// Dynamic keyboard layout that delegates to the selected layout at runtime.
+/// Also fixes the Oem7 bug in US104 layout (scancode 0x2B not mapped).
+pub struct PolarLayout;
+
+impl KeyboardLayout for PolarLayout {
+    fn map_keycode(
+        &self,
+        keycode: KeyCode,
+        modifiers: &Modifiers,
+        handle_ctrl: HandleControl,
+    ) -> DecodedKey {
+        match current_layout() {
+            LayoutId::Us104 => {
+                // Fix: Us104Key doesn't handle Oem7 (scancode 0x2B = the \| key
+                // on ANSI keyboards). It only handles Oem5 (scancode 0x56, ISO extra key).
+                if keycode == KeyCode::Oem7 {
+                    if modifiers.is_shifted() {
+                        DecodedKey::Unicode('|')
+                    } else {
+                        DecodedKey::Unicode('\\')
+                    }
+                } else {
+                    layouts::Us104Key.map_keycode(keycode, modifiers, handle_ctrl)
+                }
+            }
+            LayoutId::Uk105 => {
+                layouts::Uk105Key.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::De105 => {
+                layouts::De105Key.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::Azerty => {
+                layouts::Azerty.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::Dvorak => {
+                layouts::Dvorak104Key.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+            LayoutId::Colemak => {
+                layouts::Colemak.map_keycode(keycode, modifiers, handle_ctrl)
+            }
+        }
+    }
+}
+
+// ---- Scancode buffer ----
 
 struct ScancodeBuffer {
     buf: [u8; BUF_SIZE],
@@ -179,13 +280,15 @@ impl ScancodeBuffer {
 static SCANCODE_QUEUE: Mutex<ScancodeBuffer> = Mutex::new(ScancodeBuffer::new());
 
 lazy_static::lazy_static! {
-    static ref KEYBOARD: Mutex<Keyboard<layouts::Us104Key, ScancodeSet1>> =
+    static ref KEYBOARD: Mutex<Keyboard<PolarLayout, ScancodeSet1>> =
         Mutex::new(Keyboard::new(
             ScancodeSet1::new(),
-            layouts::Us104Key,
+            PolarLayout,
             HandleControl::Ignore,
         ));
 }
+
+// ---- Public API ----
 
 pub fn add_scancode(scancode: u8) {
     SCANCODE_QUEUE.lock().push(scancode);
@@ -255,7 +358,6 @@ pub fn read_key() -> KeyEvent {
 ```
 
 src/drivers/mod.rs
-
 ```rust
 pub mod vga;
 pub mod serial;
@@ -266,7 +368,6 @@ pub mod mouse;
 ```
 
 src/drivers/mouse.rs
-
 ```rust
 use spin::Mutex;
 use x86_64::instructions::port::Port;
@@ -453,7 +554,6 @@ pub fn handle_byte(byte: u8) {
 ```
 
 src/drivers/serial.rs
-
 ```rust
 use lazy_static::lazy_static;
 use spin::Mutex;
@@ -499,7 +599,6 @@ macro_rules! serial_println {
 ```
 
 src/drivers/vga.rs
-
 ```rust
 use core::fmt;
 use lazy_static::lazy_static;
@@ -725,10 +824,217 @@ pub fn update_status_bar(left: &str, right: &str) {
 
 ```
 
-src/fs/mod.rs
+src/fs/fat.rs
+```rust
+use alloc::string::String;
+use alloc::vec::Vec;
+use crate::drivers::ata;
 
+// FAT32 Layout:
+// [ Reserved (Boot Sector...) ] [ FAT 1 ] [ FAT 2 ] [ Data Region (Clusters) ]
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct BPB {
+    jmp: [u8; 3],
+    oem: [u8; 8],
+    bytes_per_sector: u16,
+    sectors_per_cluster: u8,
+    reserved_sectors: u16,
+    fats: u8,
+    root_entries: u16,
+    total_sectors_16: u16,
+    media: u8,
+    sectors_per_fat_16: u16,
+    sectors_per_track: u16,
+    heads: u16,
+    hidden_sectors: u32,
+    total_sectors_32: u32,
+    
+    // FAT32 Extended
+    sectors_per_fat_32: u32,
+    ext_flags: u16,
+    fs_ver: u16,
+    root_cluster: u32,
+    fs_info: u16,
+    bk_boot_sec: u16,
+    reserved: [u8; 12],
+    drive_num: u8,
+    reserved2: u8,
+    boot_sig: u8,
+    vol_id: u32,
+    vol_label: [u8; 11],
+    fs_type: [u8; 8],
+}
+
+#[derive(Debug, Clone, Copy)]
+#[repr(C, packed)]
+struct DirEntry {
+    name: [u8; 8],
+    ext: [u8; 3],
+    attr: u8,
+    reserved: u8,
+    creation_ms: u8,
+    creation_time: u16,
+    creation_date: u16,
+    last_access_date: u16,
+    cluster_high: u16,
+    time: u16,
+    date: u16,
+    cluster_low: u16,
+    size: u32,
+}
+
+impl DirEntry {
+    fn is_free(&self) -> bool {
+        self.name[0] == 0xE5
+    }
+    fn is_end(&self) -> bool {
+        self.name[0] == 0x00
+    }
+    fn is_long_name(&self) -> bool {
+        self.attr == 0x0F
+    }
+    fn is_dir(&self) -> bool {
+        (self.attr & 0x10) != 0
+    }
+    fn filename(&self) -> String {
+        let mut name = String::new();
+        for &b in &self.name {
+            if b != 0x20 { name.push(b as char); }
+        }
+        if self.ext[0] != 0x20 {
+            name.push('.');
+            for &b in &self.ext {
+                if b != 0x20 { name.push(b as char); }
+            }
+        }
+        name
+    }
+    fn cluster(&self) -> u32 {
+        ((self.cluster_high as u32) << 16) | (self.cluster_low as u32)
+    }
+}
+
+// Global cached FS info could be stored here, but for simplicity we read BPB every time or assume LBA 0 (Partition 0) or LBA 2048 (if MBR present).
+// Let's assume MBR and Partition 1 is FAT32. Or just try LBA 0.
+const PARTITION_OFFSET: u32 = 0; // Try 0 (superfloppy) or 2048?
+// Standard MBR often puts first partition at 2048.
+// We will try to read LBA 0, check signature. If MBR, read partition table.
+
+pub fn list_root_files() -> Vec<String> {
+    let mut files = Vec::new();
+    
+    // Read Boot Sector
+    let mut sector = [0u8; 512];
+    if !ata::read_sector(PARTITION_OFFSET, &mut sector) {
+        files.push("ATA Read Error".into());
+        return files;
+    }
+
+    // Basic check for BPB
+    // We cast to BPB. 
+    // Note: This is unsafe casting of packed struct.
+    let bpb = unsafe { &*(sector.as_ptr() as *const BPB) };
+
+    if bpb.bytes_per_sector != 512 {
+        // Might be MBR?
+        files.push("Not valid FAT32 (invalid sector size)".into());
+        return files;
+    }
+    
+    // Calculate offsets
+    let fat_start = PARTITION_OFFSET + bpb.reserved_sectors as u32;
+    let fat_size = bpb.sectors_per_fat_32;
+    let data_start = fat_start + (bpb.fats as u32 * fat_size);
+    let root_cluster = bpb.root_cluster;
+    
+    // Read Root Directory (which is a cluster chain)
+    // For MVP, read just the first cluster of Root Dir.
+    let root_lba = cluster_to_lba(root_cluster, data_start, bpb.sectors_per_cluster);
+    
+    if !ata::read_sector(root_lba, &mut sector) {
+        files.push("Failed to read Root Dir".into());
+        return files;
+    }
+
+    // Parse entries
+    for i in 0..16 { // 512 / 32 = 16 entries per sector
+        let ptr = unsafe { sector.as_ptr().add(i * 32) };
+        let entry = unsafe { &*(ptr as *const DirEntry) };
+
+        if entry.is_end() { break; }
+        if entry.is_free() || entry.is_long_name() { continue; }
+        
+        let mut name = entry.filename();
+        if entry.is_dir() {
+            name.push('/');
+        } else {
+            let size = entry.size;
+            name.push_str(&alloc::format!(" ({} b)", size));
+        }
+        files.push(name);
+    }
+
+    files
+}
+
+fn cluster_to_lba(cluster: u32, data_start: u32, sectors_per_cluster: u8) -> u32 {
+    data_start + ((cluster - 2) * sectors_per_cluster as u32)
+}
+
+pub fn read_file(name: &str) -> Option<Vec<u8>> {
+    // Re-read BPB logic (should be cached)
+    let mut sector = [0u8; 512];
+    ata::read_sector(PARTITION_OFFSET, &mut sector);
+    let bpb = unsafe { &*(sector.as_ptr() as *const BPB) };
+    
+    let fat_start = PARTITION_OFFSET + bpb.reserved_sectors as u32;
+    let fat_size = bpb.sectors_per_fat_32;
+    let data_start = fat_start + (bpb.fats as u32 * fat_size);
+    
+    // Find file in root dir
+    let root_lba = cluster_to_lba(bpb.root_cluster, data_start, bpb.sectors_per_cluster);
+    ata::read_sector(root_lba, &mut sector);
+
+    let mut found_entry: Option<DirEntry> = None;
+    
+    for i in 0..16 {
+        let ptr = unsafe { sector.as_ptr().add(i * 32) };
+        let entry = unsafe { &*(ptr as *const DirEntry) };
+        if entry.is_end() { break; }
+        if entry.is_free() || entry.is_long_name() { continue; }
+        
+        if entry.filename() == name {
+            found_entry = Some(*entry);
+            break;
+        }
+    }
+
+    if let Some(entry) = found_entry {
+        // Read file content (single cluster for now)
+        let start_cluster = entry.cluster();
+        let lba = cluster_to_lba(start_cluster, data_start, bpb.sectors_per_cluster);
+        
+        let mut data = Vec::with_capacity(entry.size as usize);
+        let mut buf = [0u8; 512];
+        
+        // Read just one sector/cluster for demo
+        // Todo: Follow FAT chain
+        ata::read_sector(lba, &mut buf);
+        data.extend_from_slice(&buf[..entry.size.min(512) as usize]);
+        
+        return Some(data);
+    }
+
+    None
+}
+```
+
+src/fs/mod.rs
 ```rust
 pub mod ramfs;
+pub mod fat;
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -776,7 +1082,6 @@ pub fn init() {
 ```
 
 src/fs/ramfs.rs
-
 ```rust
 use alloc::collections::BTreeMap;
 use alloc::string::String;
@@ -999,7 +1304,6 @@ impl FileSystem for RamFs {
 ```
 
 src/gui/compositor.rs
-
 ```rust
 use alloc::vec::Vec;
 use alloc::boxed::Box;
@@ -1162,7 +1466,6 @@ impl Compositor {
 ```
 
 src/gui/cursor.rs
-
 ```rust
 use super::framebuffer::Framebuffer;
 
@@ -1239,7 +1542,6 @@ impl Cursor {
 ```
 
 src/gui/event.rs
-
 ```rust
 use spin::Mutex;
 
@@ -1319,7 +1621,6 @@ pub static EVENT_QUEUE: Mutex<EventQueue> = Mutex::new(EventQueue::new());
 ```
 
 src/gui/font.rs
-
 ```rust
 use super::framebuffer::Framebuffer;
 use font8x8::legacy::BASIC_LEGACY;
@@ -1372,22 +1673,130 @@ pub fn draw_text_bg(fb: &mut Framebuffer, x: i16, y: i16, text: &str, fg: u8, bg
     }
 }
 
-pub fn text_width(text: &str) -> u16 {24-bit True Color (16,7 miliona kolorów) + 8-bit alpha
+pub fn text_width(text: &str) -> u16 {
     text.len() as u16 * CHAR_WIDTH
 }
 
 ```
 
 src/gui/framebuffer.rs
-
 ```rust
 use alloc::boxed::Box;
+use x86_64::instructions::port::Port;
 
 pub const SCREEN_WIDTH: u16 = 320;
 pub const SCREEN_HEIGHT: u16 = 200;
 const FB_SIZE: usize = SCREEN_WIDTH as usize * SCREEN_HEIGHT as usize; // 64000
 
 const VGA_FRAMEBUFFER: *mut u8 = 0xA0000 as *mut u8;
+
+/// Standard VGA Mode 13h register values (320x200x256 linear)
+/// Reference: FreeVGA, OSDev wiki
+const MODE_13H_MISC: u8 = 0x63;
+
+const MODE_13H_SEQ: [u8; 5] = [
+    0x03, // Reset
+    0x01, // Clocking Mode (8-dot)
+    0x0F, // Map Mask (all planes)
+    0x00, // Character Map Select
+    0x0E, // Sequencer Memory Mode (chain-4)
+];
+
+const MODE_13H_CRTC: [u8; 25] = [
+    0x5F, // Horizontal Total
+    0x4F, // Horizontal Display End
+    0x50, // Start Horizontal Blanking
+    0x82, // End Horizontal Blanking
+    0x54, // Start Horizontal Retrace
+    0x80, // End Horizontal Retrace
+    0xBF, // Vertical Total
+    0x1F, // Overflow
+    0x00, // Preset Row Scan
+    0x41, // Maximum Scan Line
+    0x00, // Cursor Start
+    0x00, // Cursor End
+    0x00, // Start Address High
+    0x00, // Start Address Low
+    0x00, // Cursor Location High
+    0x00, // Cursor Location Low
+    0x9C, // Start Vertical Retrace
+    0x0E, // End Vertical Retrace (also unlocks CRTC)
+    0x8F, // Vertical Display End
+    0x28, // Offset (logical width / 8 = 320/8 = 40 = 0x28)
+    0x40, // Underline Location
+    0x96, // Start Vertical Blanking
+    0xB9, // End Vertical Blanking
+    0xA3, // Mode Control
+    0xFF, // Line Compare
+];
+
+const MODE_13H_GC: [u8; 9] = [
+    0x00, // Set/Reset
+    0x00, // Enable Set/Reset
+    0x00, // Color Compare
+    0x00, // Data Rotate
+    0x00, // Read Map Select
+    0x40, // Graphics Mode (256-color)
+    0x05, // Miscellaneous Graphics
+    0x0F, // Color Don't Care
+    0xFF, // Bit Mask
+];
+
+const MODE_13H_AC: [u8; 21] = [
+    0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+    0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F,
+    0x41, // Attribute Mode Control
+    0x00, // Overscan Color
+    0x0F, // Color Plane Enable
+    0x00, // Horizontal Pixel Panning
+    0x00, // Color Select
+];
+
+/// Switch VGA hardware to Mode 13h (320x200, 256 colors, linear framebuffer)
+/// Must be called before any framebuffer writes.
+pub fn set_mode_13h() {
+    unsafe {
+        // Write Miscellaneous Output Register
+        Port::<u8>::new(0x3C2).write(MODE_13H_MISC);
+
+        // Sequencer registers
+        for (i, &val) in MODE_13H_SEQ.iter().enumerate() {
+            Port::<u8>::new(0x3C4).write(i as u8);
+            Port::<u8>::new(0x3C5).write(val);
+        }
+
+        // Unlock CRTC (clear protect bit in register 0x11)
+        Port::<u8>::new(0x3D4).write(0x11);
+        let val = Port::<u8>::new(0x3D5).read();
+        Port::<u8>::new(0x3D4).write(0x11);
+        Port::<u8>::new(0x3D5).write(val & 0x7F);
+
+        // CRTC registers
+        for (i, &val) in MODE_13H_CRTC.iter().enumerate() {
+            Port::<u8>::new(0x3D4).write(i as u8);
+            Port::<u8>::new(0x3D5).write(val);
+        }
+
+        // Graphics Controller registers
+        for (i, &val) in MODE_13H_GC.iter().enumerate() {
+            Port::<u8>::new(0x3CE).write(i as u8);
+            Port::<u8>::new(0x3CF).write(val);
+        }
+
+        // Attribute Controller registers
+        // Reading 0x3DA resets the AC flip-flop to index mode
+        let _ = Port::<u8>::new(0x3DA).read();
+        for (i, &val) in MODE_13H_AC.iter().enumerate() {
+            Port::<u8>::new(0x3C0).write(i as u8);
+            Port::<u8>::new(0x3C0).write(val);
+        }
+        // Re-enable video output (set bit 5)
+        Port::<u8>::new(0x3C0).write(0x20);
+
+        // Clear framebuffer to black
+        core::ptr::write_bytes(VGA_FRAMEBUFFER, 0, FB_SIZE);
+    }
+}
 
 pub struct Framebuffer {
     buffer: Box<[u8; FB_SIZE]>,
@@ -1444,7 +1853,6 @@ impl Framebuffer {
 ```
 
 src/gui/mod.rs
-
 ```rust
 pub mod framebuffer;
 pub mod primitives;
@@ -1478,6 +1886,10 @@ pub fn next_id() -> u32 {
 
 pub fn run() -> ! {
     crate::serial_println!("[GUI] Initializing...");
+
+    // Switch to VGA Mode 13h (320x200x256)
+    framebuffer::set_mode_13h();
+    crate::serial_println!("[GUI] VGA Mode 13h set");
 
     // Load VGA palette
     palette::load_palette();
@@ -1581,7 +1993,6 @@ fn spawn_terminal_window(compositor: &mut Compositor, theme: &Theme) {
 ```
 
 src/gui/palette.rs
-
 ```rust
 use x86_64::instructions::port::Port;
 
@@ -1690,7 +2101,6 @@ pub fn load_palette() {
 ```
 
 src/gui/primitives.rs
-
 ```rust
 use super::framebuffer::Framebuffer;
 
@@ -1750,7 +2160,6 @@ pub fn draw_line(fb: &mut Framebuffer, x0: i16, y0: i16, x1: i16, y1: i16, color
 ```
 
 src/gui/theme.rs
-
 ```rust
 use super::palette;
 
@@ -1803,7 +2212,6 @@ pub fn default_dark_theme() -> Theme {
 ```
 
 src/gui/wallpaper.rs
-
 ```rust
 use alloc::vec::Vec;
 
@@ -2058,7 +2466,6 @@ pub fn render_wallpaper(width: u16, height: u16, bg_color: u8, logo_color: u8) -
 ```
 
 src/gui/widget/button.rs
-
 ```rust
 use alloc::string::String;
 use super::{Widget, Rect, EventResponse};
@@ -2167,7 +2574,6 @@ impl Widget for Button {
 ```
 
 src/gui/widget/desktop.rs
-
 ```rust
 use alloc::vec::Vec;
 use super::{Widget, Rect, EventResponse};
@@ -2299,7 +2705,6 @@ fn format_time<'a>(buf: &'a mut [u8; 16], h: u64, m: u64, s: u64) -> &'a str {
 ```
 
 src/gui/widget/label.rs
-
 ```rust
 use alloc::string::String;
 use super::{Widget, Rect, EventResponse};
@@ -2357,7 +2762,6 @@ impl Widget for Label {
 ```
 
 src/gui/widget/mod.rs
-
 ```rust
 pub mod desktop;
 pub mod window;
@@ -2412,7 +2816,6 @@ pub trait Widget {
 ```
 
 src/gui/widget/panel.rs
-
 ```rust
 use alloc::vec::Vec;
 use alloc::boxed::Box;
@@ -2497,7 +2900,6 @@ impl Widget for Panel {
 ```
 
 src/gui/widget/terminal.rs
-
 ```rust
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -2594,17 +2996,79 @@ impl TerminalWidget {
             return;
         }
 
-        // Split on pipe and chain commands
+        // Expand environment variables
+        let expanded = crate::shell::commands::expand_env_vars(trimmed);
+        let trimmed = expanded.trim();
+
+        // Parse redirections
+        let (pipeline_str, redir_out, redir_append, redir_in) = self.parse_redirections(trimmed);
+
+        // Handle input redirection
         let mut pipe_data: Option<String> = None;
-        for part in trimmed.split('|') {
+        if let Some(ref input_file) = redir_in {
+            use crate::fs::{FS, FileSystem};
+            let fs = FS.lock();
+            match fs.read(&self.cwd, input_file) {
+                Some(data) => {
+                    pipe_data = Some(String::from(core::str::from_utf8(data).unwrap_or("")));
+                }
+                None => {
+                    self.push_line(&format!("Plik '{}' nie istnieje.", input_file));
+                    return;
+                }
+            }
+        }
+
+        // Split on pipe and chain commands
+        for part in pipeline_str.split('|') {
             let part = part.trim();
             if part.is_empty() { continue; }
-            let output = self.run_command(part, pipe_data.as_deref());
+
+            let (cmd, args) = match part.split_once(' ') {
+                Some((c, a)) => (c, a),
+                None => (part, ""),
+            };
+
+            // Handle clear specially in GUI
+            if cmd == "clear" {
+                self.lines.clear();
+                pipe_data = Some(String::new());
+                continue;
+            }
+
+            let output = crate::shell::commands::run_command(
+                cmd, args, &mut self.cwd, pipe_data.as_deref()
+            );
             pipe_data = Some(output);
         }
 
+        // Handle output
         if let Some(output) = pipe_data {
-            if !output.is_empty() {
+            if let Some(ref filename) = redir_out {
+                use crate::fs::{FS, FileSystem};
+                let mut fs = FS.lock();
+                if fs.write(&self.cwd, filename, output.as_bytes()) {
+                    self.push_line(&format!("Zapisano do '{}'.", filename));
+                } else {
+                    self.push_line(&format!("Nie mozna zapisac do '{}'.", filename));
+                }
+            } else if let Some(ref filename) = redir_append {
+                use crate::fs::{FS, FileSystem};
+                let mut fs = FS.lock();
+                let mut existing = match fs.read(&self.cwd, filename) {
+                    Some(data) => Vec::from(data),
+                    None => Vec::new(),
+                };
+                if !existing.is_empty() && existing.last() != Some(&b'\n') {
+                    existing.push(b'\n');
+                }
+                existing.extend_from_slice(output.as_bytes());
+                if fs.write(&self.cwd, filename, &existing) {
+                    self.push_line(&format!("Dopisano do '{}'.", filename));
+                } else {
+                    self.push_line(&format!("Nie mozna dopisac do '{}'.", filename));
+                }
+            } else if !output.is_empty() {
                 for line in output.lines() {
                     self.push_line(line);
                 }
@@ -2612,291 +3076,40 @@ impl TerminalWidget {
         }
     }
 
-    fn run_command(&mut self, line: &str, pipe_input: Option<&str>) -> String {
-        let (cmd, args) = match line.split_once(' ') {
-            Some((c, a)) => (c, a),
-            None => (line, ""),
-        };
+    fn parse_redirections<'a>(&self, line: &'a str) -> (&'a str, Option<String>, Option<String>, Option<String>) {
+        // Returns (pipeline_str, write_file, append_file, input_file)
+        let mut write_file = None;
+        let mut append_file = None;
+        let mut input_file = None;
+        let mut pipeline_end = line.len();
 
-        match cmd {
-            "help" => self.cmd_help(),
-            "echo" => String::from(args),
-            "clear" => {
-                self.lines.clear();
-                String::new()
+        // Check for >>
+        if let Some(pos) = line.rfind(">>") {
+            let filename = line[pos + 2..].trim();
+            if !filename.is_empty() && !filename.contains('|') {
+                append_file = Some(String::from(filename));
+                pipeline_end = pos;
             }
-            "ls" => self.cmd_ls(),
-            "cat" => self.cmd_cat(args),
-            "touch" => self.cmd_touch(args),
-            "write" => self.cmd_write(args),
-            "rm" => self.cmd_rm(args),
-            "mkdir" => self.cmd_mkdir(args),
-            "cd" => { self.cmd_cd(args); String::new() }
-            "pwd" => self.cmd_pwd(),
-            "uptime" => self.cmd_uptime(),
-            "info" => self.cmd_info(),
-            "ps" => self.cmd_ps(),
-            "grep" => self.cmd_grep(args, pipe_input),
-            "wc" => self.cmd_wc(args, pipe_input),
-            _ => format!("Nieznana komenda: '{}'. Wpisz 'help'.", cmd),
-        }
-    }
-
-    fn cmd_help(&self) -> String {
-        let mut s = String::new();
-        s.push_str("Dostepne komendy:\n");
-        s.push_str("  help      - Pomoc\n");
-        s.push_str("  echo <t>  - Wyswietl tekst\n");
-        s.push_str("  clear     - Wyczysc terminal\n");
-        s.push_str("  ls        - Lista plikow\n");
-        s.push_str("  cat <f>   - Pokaz plik\n");
-        s.push_str("  touch <f> - Utworz plik\n");
-        s.push_str("  write <f> <t> - Zapisz\n");
-        s.push_str("  rm <n>    - Usun\n");
-        s.push_str("  mkdir <n> - Nowy katalog\n");
-        s.push_str("  cd <d>    - Zmien katalog\n");
-        s.push_str("  pwd       - Biezacy katalog\n");
-        s.push_str("  uptime    - Czas dzialania\n");
-        s.push_str("  info      - Info systemowe\n");
-        s.push_str("  ps        - Lista taskow\n");
-        s.push_str("  grep <w> [f] - Szukaj wzorca\n");
-        s.push_str("  wc [plik] - Policz linie/slowa\n");
-        s.push_str("Pipe: cmd1 | cmd2");
-        s
-    }
-
-    fn cmd_ls(&self) -> String {
-        use crate::fs::{FS, FileSystem};
-        let fs = FS.lock();
-        match fs.list(&self.cwd) {
-            Some(entries) => {
-                if entries.is_empty() {
-                    return String::from("(pusty katalog)");
-                }
-                let mut s = String::new();
-                for entry in &entries {
-                    if entry.is_dir {
-                        s.push_str("  ");
-                        s.push_str(&entry.name);
-                        s.push_str("/\n");
-                    } else {
-                        s.push_str(&format!("  {} ({} B)\n", entry.name, entry.size));
-                    }
-                }
-                if s.ends_with('\n') { s.pop(); }
-                s
-            }
-            None => String::from("Katalog nie istnieje."),
-        }
-    }
-
-    fn cmd_cat(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: cat <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(&self.cwd, name) {
-            Some(data) => {
-                String::from(core::str::from_utf8(data).unwrap_or("<dane binarne>"))
-            }
-            None => format!("Plik '{}' nie istnieje.", name),
-        }
-    }
-
-    fn cmd_touch(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: touch <plik>"),
-        };
-        let mut fs = FS.lock();
-        if fs.create(&self.cwd, name) {
-            format!("Utworzono '{}'.", name)
-        } else {
-            format!("'{}' juz istnieje.", name)
-        }
-    }
-
-    fn cmd_write(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let (name, content) = match args.split_once(' ') {
-            Some((n, c)) => (n, c),
-            None => return String::from("Uzycie: write <plik> <tekst>"),
-        };
-        let mut fs = FS.lock();
-        if fs.write(&self.cwd, name, content.as_bytes()) {
-            format!("Zapisano {} B do '{}'.", content.len(), name)
-        } else {
-            format!("Nie mozna zapisac do '{}'.", name)
-        }
-    }
-
-    fn cmd_rm(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem, RemoveResult};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: rm <nazwa>"),
-        };
-        let mut fs = FS.lock();
-        match fs.remove(&self.cwd, name) {
-            RemoveResult::Ok => format!("Usunieto '{}'.", name),
-            RemoveResult::NotFound => format!("'{}' nie istnieje.", name),
-            RemoveResult::DirNotEmpty => format!("Katalog '{}' nie jest pusty.", name),
-        }
-    }
-
-    fn cmd_mkdir(&self, args: &str) -> String {
-        use crate::fs::{FS, FileSystem};
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: mkdir <nazwa>"),
-        };
-        let mut fs = FS.lock();
-        if fs.mkdir(&self.cwd, name) {
-            format!("Utworzono katalog '{}'.", name)
-        } else {
-            format!("'{}' juz istnieje.", name)
-        }
-    }
-
-    fn cmd_cd(&mut self, args: &str) {
-        use crate::fs::{FS, FileSystem};
-        let target = match args.split_whitespace().next() {
-            Some(t) => t,
-            None => { self.cwd.clear(); return; }
-        };
-        match target {
-            "/" => self.cwd.clear(),
-            ".." => { self.cwd.pop(); }
-            "." => {}
-            name => {
-                let (exists, is_dir) = {
-                    let fs = FS.lock();
-                    (fs.exists(&self.cwd, name), fs.is_dir(&self.cwd, name))
-                };
-                if !exists {
-                    self.push_line(&format!("'{}' nie istnieje.", name));
-                } else if is_dir {
-                    self.cwd.push(String::from(name));
-                } else {
-                    self.push_line(&format!("'{}' nie jest katalogiem.", name));
-                }
+        } else if let Some(pos) = line.rfind('>') {
+            let filename = line[pos + 1..].trim();
+            if !filename.is_empty() && !filename.contains('|') {
+                write_file = Some(String::from(filename));
+                pipeline_end = pos;
             }
         }
-    }
 
-    fn cmd_pwd(&self) -> String {
-        if self.cwd.is_empty() {
-            String::from("/")
-        } else {
-            let mut s = String::new();
-            for c in &self.cwd {
-                s.push('/');
-                s.push_str(c);
-            }
-            s
-        }
-    }
+        let remaining = &line[..pipeline_end];
 
-    fn cmd_uptime(&self) -> String {
-        let t = crate::kernel::timer::ticks();
-        let hz = crate::kernel::timer::TIMER_HZ as u64;
-        let total_secs = t / hz;
-        let h = total_secs / 3600;
-        let m = (total_secs % 3600) / 60;
-        let s = total_secs % 60;
-        format!("Uptime: {}h {:02}m {:02}s ({} tickow)", h, m, s, t)
-    }
-
-    fn cmd_info(&self) -> String {
-        let (heap_used, heap_free) = crate::kernel::memory::heap::heap_stats();
-        let total_kb = (heap_used + heap_free) / 1024;
-        let used_kb = heap_used / 1024;
-        let mut s = String::new();
-        s.push_str("=== Info systemowe ===\n");
-        s.push_str("  System:    PolarOs v0.1.0\n");
-        s.push_str("  Arch:      x86_64\n");
-        s.push_str("  Tryb:      VGA 320x200 256c\n");
-        s.push_str(&format!("  Heap:      {}/{} KiB", used_kb, total_kb));
-        s
-    }
-
-    fn cmd_grep(&self, args: &str, pipe_input: Option<&str>) -> String {
-        let parts: Vec<&str> = args.split_whitespace().collect();
-        let pattern = match parts.first() {
-            Some(p) => *p,
-            None => return String::from("Uzycie: grep <wzorzec> [plik]"),
-        };
-
-        let text = if let Some(input) = pipe_input {
-            String::from(input)
-        } else {
-            use crate::fs::{FS, FileSystem};
-            let filename = match parts.get(1) {
-                Some(f) => *f,
-                None => return String::from("Uzycie: grep <wzorzec> <plik>"),
-            };
-            let fs = FS.lock();
-            match fs.read(&self.cwd, filename) {
-                Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-                None => return format!("Plik '{}' nie istnieje.", filename),
-            }
-        };
-
-        let mut result = String::new();
-        for line in text.lines() {
-            if line.contains(pattern) {
-                result.push_str(line);
-                result.push('\n');
+        // Check for <
+        if let Some(pos) = remaining.rfind('<') {
+            let filename = remaining[pos + 1..].trim();
+            if !filename.is_empty() {
+                input_file = Some(String::from(filename));
+                return (&remaining[..pos], write_file, append_file, input_file);
             }
         }
-        if result.ends_with('\n') { result.pop(); }
-        if result.is_empty() {
-            format!("Brak wynikow dla '{}'.", pattern)
-        } else {
-            result
-        }
-    }
 
-    fn cmd_wc(&self, args: &str, pipe_input: Option<&str>) -> String {
-        let text = if let Some(input) = pipe_input {
-            String::from(input)
-        } else {
-            use crate::fs::{FS, FileSystem};
-            let name = match args.split_whitespace().next() {
-                Some(n) => n,
-                None => return String::from("Uzycie: wc <plik>"),
-            };
-            let fs = FS.lock();
-            match fs.read(&self.cwd, name) {
-                Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-                None => return format!("Plik '{}' nie istnieje.", name),
-            }
-        };
-
-        let bytes = text.len();
-        let lines = text.lines().count();
-        let words = text.split_whitespace().count();
-        format!("  {} linii  {} slow  {} bajtow", lines, words, bytes)
-    }
-
-    fn cmd_ps(&self) -> String {
-        use crate::kernel::task::{SCHEDULER, TaskState};
-        let mut s = String::new();
-        s.push_str("  ID  STAN        NAZWA\n");
-        let sched = SCHEDULER.lock();
-        for task in sched.task_list() {
-            let state_str = match task.state {
-                TaskState::Ready => "Ready     ",
-                TaskState::Running => "Running   ",
-                TaskState::Terminated => "Terminated",
-            };
-            s.push_str(&format!("  {:3} {} {}\n", task.id.0, state_str, task.name));
-        }
-        if s.ends_with('\n') { s.pop(); }
-        s
+        (remaining, write_file, append_file, input_file)
     }
 }
 
@@ -3007,7 +3220,6 @@ impl Widget for TerminalWidget {
 ```
 
 src/gui/widget/window.rs
-
 ```rust
 use alloc::string::String;
 use alloc::boxed::Box;
@@ -3164,8 +3376,86 @@ impl Widget for Window {
 
 ```
 
-src/kernel/gdt.rs
+src/kernel/elf.rs
+```rust
+use xmas_elf::{ElfFile, program::Type};
+use x86_64::{
+    structures::paging::{Page, PageTableFlags, Mapper, Size4KiB, FrameAllocator},
+    VirtAddr,
+};
+use crate::kernel::memory::MEMORY_MANAGER;
 
+pub fn load_and_map_elf(data: &[u8]) -> Result<u64, &'static str> {
+    let elf = ElfFile::new(data).map_err(|_| "Failed to parse ELF")?;
+
+    if elf.header.pt1.class() != xmas_elf::header::Class::SixtyFour {
+        return Err("Not 64-bit ELF");
+    }
+    if elf.header.pt2.machine().as_machine() != xmas_elf::header::Machine::X86_64 {
+        return Err("Not x86_64 ELF");
+    }
+
+    let mut mm = MEMORY_MANAGER.lock();
+    // Destructure to split borrows
+    let mm_ref = &mut *mm;
+    let mapper = mm_ref.mapper.as_mut().ok_or("Memory manager not initialized")?;
+    let allocator = mm_ref.frame_allocator.as_mut().ok_or("Frame allocator not initialized")?;
+
+    for ph in elf.program_iter() {
+        if ph.get_type() == Ok(Type::Load) {
+            let virt_start_addr = ph.virtual_addr();
+            let mem_size = ph.mem_size();
+            let file_size = ph.file_size();
+            let file_offset = ph.offset();
+
+            let start_page = Page::containing_address(VirtAddr::new(virt_start_addr));
+            let end_page = Page::containing_address(VirtAddr::new(virt_start_addr + mem_size - 1));
+
+            let mut flags = PageTableFlags::PRESENT;
+            if !ph.flags().is_execute() {
+                flags |= PageTableFlags::NO_EXECUTE;
+            }
+            if ph.flags().is_write() {
+                flags |= PageTableFlags::WRITABLE;
+            }
+
+            for page in Page::<Size4KiB>::range_inclusive(start_page, end_page) {
+                // Check if already mapped
+                if mapper.translate_page(page).is_err() {
+                    let frame = allocator.allocate_frame().ok_or("Out of memory")?;
+                    unsafe {
+                        mapper.map_to(page, frame, flags, allocator)
+                            .map_err(|_| "Map failed")?
+                            .flush();
+                    }
+                }
+            }
+
+            // Copy data
+            let dest_ptr = virt_start_addr as *mut u8;
+            unsafe {
+                // Copy segment data
+                if file_size > 0 {
+                    let data_start = file_offset as usize;
+                    let data_end = data_start + file_size as usize;
+                    let src = &data[data_start..data_end];
+                    core::ptr::copy_nonoverlapping(src.as_ptr(), dest_ptr, src.len());
+                }
+                // Zero out BSS
+                if mem_size > file_size {
+                    let bss_start = dest_ptr.add(file_size as usize);
+                    core::ptr::write_bytes(bss_start, 0, (mem_size - file_size) as usize);
+                }
+            }
+        }
+    }
+
+    Ok(elf.header.pt2.entry_point())
+}
+
+```
+
+src/kernel/gdt.rs
 ```rust
 use lazy_static::lazy_static;
 use x86_64::structures::gdt::{Descriptor, GlobalDescriptorTable, SegmentSelector};
@@ -3235,7 +3525,6 @@ pub fn init() {
 ```
 
 src/kernel/idt.rs
-
 ```rust
 use lazy_static::lazy_static;
 use x86_64::structures::idt::{InterruptDescriptorTable, InterruptStackFrame, PageFaultErrorCode};
@@ -3327,7 +3616,6 @@ extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptStackFr
 ```
 
 src/kernel/memory/frame_allocator.rs
-
 ```rust
 use bootloader::bootinfo::{MemoryMap, MemoryRegionType};
 use x86_64::{
@@ -3374,7 +3662,6 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
 ```
 
 src/kernel/memory/heap.rs
-
 ```rust
 use linked_list_allocator::LockedHeap;
 use x86_64::{
@@ -3427,16 +3714,28 @@ pub fn heap_stats() -> (usize, usize) {
 ```
 
 src/kernel/memory/mod.rs
-
 ```rust
 pub mod paging;
 pub mod frame_allocator;
 pub mod heap;
 
+use spin::Mutex;
+use x86_64::structures::paging::OffsetPageTable;
+use self::frame_allocator::BootInfoFrameAllocator;
+
+pub struct MemoryManager {
+    pub mapper: Option<OffsetPageTable<'static>>,
+    pub frame_allocator: Option<BootInfoFrameAllocator>,
+}
+
+pub static MEMORY_MANAGER: Mutex<MemoryManager> = Mutex::new(MemoryManager {
+    mapper: None,
+    frame_allocator: None,
+});
+
 ```
 
 src/kernel/memory/paging.rs
-
 ```rust
 use x86_64::{
     structures::paging::{OffsetPageTable, PageTable},
@@ -3463,7 +3762,6 @@ unsafe fn active_level_4_table(physical_memory_offset: VirtAddr) -> &'static mut
 ```
 
 src/kernel/mod.rs
-
 ```rust
 pub mod gdt;
 pub mod idt;
@@ -3472,11 +3770,11 @@ pub mod timer;
 pub mod memory;
 pub mod task;
 pub mod syscall;
+pub mod elf;
 
 ```
 
 src/kernel/pic.rs
-
 ```rust
 use pic8259::ChainedPics;
 use spin;
@@ -3508,15 +3806,49 @@ impl InterruptIndex {
 ```
 
 src/kernel/syscall/handlers.rs
-
 ```rust
+use alloc::string::String;
+use alloc::vec::Vec;
 use crate::kernel::task;
+use crate::fs::{FS, FileSystem};
 
 /// Syscall numbers
 pub const SYS_EXIT: u64 = 0;
 pub const SYS_WRITE: u64 = 1;
 pub const SYS_YIELD: u64 = 2;
 pub const SYS_GETPID: u64 = 3;
+pub const SYS_OPEN: u64 = 4;
+pub const SYS_READ: u64 = 5;
+pub const SYS_CLOSE: u64 = 6;
+pub const SYS_STAT: u64 = 7;
+
+/// Per-task file descriptor table.
+/// fd 0 = stdin (not really usable yet), fd 1 = stdout, fd 2 = stderr.
+/// fd 3+ = opened files.
+const MAX_FDS: usize = 16;
+
+struct OpenFile {
+    path: Vec<String>,
+    name: String,
+    offset: usize,
+}
+
+static mut FD_TABLE: [Option<OpenFile>; MAX_FDS] = {
+    // Can't use array init with non-Copy types, use a const block
+    const NONE: Option<OpenFile> = None;
+    [NONE; MAX_FDS]
+};
+
+fn alloc_fd() -> Option<usize> {
+    unsafe {
+        for i in 3..MAX_FDS {
+            if FD_TABLE[i].is_none() {
+                return Some(i);
+            }
+        }
+    }
+    None
+}
 
 /// Main syscall dispatcher. Called from assembly entry point.
 /// Returns value in RAX.
@@ -3527,6 +3859,10 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
         SYS_WRITE => sys_write(arg0, arg1, arg2),
         SYS_YIELD => sys_yield(),
         SYS_GETPID => sys_getpid(),
+        SYS_OPEN => sys_open(arg0, arg1),
+        SYS_READ => sys_read(arg0, arg1, arg2),
+        SYS_CLOSE => sys_close(arg0),
+        SYS_STAT => sys_stat(arg0, arg1),
         _ => {
             // Unknown syscall
             u64::MAX
@@ -3536,25 +3872,28 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
 
 /// sys_exit(code) - terminate current task
 fn sys_exit(_code: u64) -> u64 {
+    // Clean up all open FDs for this task
+    unsafe {
+        for i in 3..MAX_FDS {
+            FD_TABLE[i] = None;
+        }
+    }
     task::exit_current_task();
 }
 
-/// sys_write(fd, buf_ptr, len) - write to screen (fd=1 -> VGA)
+/// sys_write(fd, buf_ptr, len) - write to screen (fd=1 or fd=2 -> VGA)
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
-    if fd != 1 {
-        return u64::MAX; // only stdout supported
+    if fd != 1 && fd != 2 {
+        return u64::MAX; // only stdout/stderr supported for writing
     }
 
     let len = len as usize;
-    // Safety: we trust that the user program has a valid buffer.
-    // In a real OS we'd validate the pointer is in user space.
     let slice = unsafe { core::slice::from_raw_parts(buf_ptr as *const u8, len) };
 
     if let Ok(s) = core::str::from_utf8(slice) {
         crate::print!("{}", s);
         len as u64
     } else {
-        // Write raw bytes
         for &byte in slice {
             if byte >= 0x20 && byte <= 0x7e || byte == b'\n' {
                 crate::print!("{}", byte as char);
@@ -3582,10 +3921,137 @@ fn sys_getpid() -> u64 {
     0
 }
 
+/// sys_open(path_ptr, path_len) -> fd or u64::MAX on error
+/// Opens a file for reading. Path is relative to root.
+fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
+    let len = path_len as usize;
+    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
+    let path_str = match core::str::from_utf8(slice) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    // Parse path: "/docs/info.txt" -> path=["docs"], name="info.txt"
+    let (dir_path, filename) = parse_file_path(path_str);
+
+    // Check if file exists
+    {
+        let fs = FS.lock();
+        if !fs.exists(&dir_path, &filename) {
+            return u64::MAX;
+        }
+        if fs.is_dir(&dir_path, &filename) {
+            return u64::MAX; // can't open directories
+        }
+    }
+
+    let fd = match alloc_fd() {
+        Some(fd) => fd,
+        None => return u64::MAX,
+    };
+
+    unsafe {
+        FD_TABLE[fd] = Some(OpenFile {
+            path: dir_path,
+            name: filename,
+            offset: 0,
+        });
+    }
+
+    fd as u64
+}
+
+/// sys_read(fd, buf_ptr, len) -> bytes_read or u64::MAX on error
+fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
+    let fd = fd as usize;
+    if fd >= MAX_FDS {
+        return u64::MAX;
+    }
+
+    let (read_bytes, new_offset) = unsafe {
+        let file = match &FD_TABLE[fd] {
+            Some(f) => f,
+            None => return u64::MAX,
+        };
+
+        let fs = FS.lock();
+        match fs.read(&file.path, &file.name) {
+            Some(data) => {
+                let remaining = if file.offset < data.len() {
+                    &data[file.offset..]
+                } else {
+                    &[]
+                };
+                let to_read = remaining.len().min(len as usize);
+                let dest = core::slice::from_raw_parts_mut(buf_ptr as *mut u8, to_read);
+                dest.copy_from_slice(&remaining[..to_read]);
+                (to_read, file.offset + to_read)
+            }
+            None => return u64::MAX,
+        }
+    };
+
+    // Update offset
+    unsafe {
+        if let Some(ref mut file) = FD_TABLE[fd] {
+            file.offset = new_offset;
+        }
+    }
+
+    read_bytes as u64
+}
+
+/// sys_close(fd) -> 0 on success, u64::MAX on error
+fn sys_close(fd: u64) -> u64 {
+    let fd = fd as usize;
+    if fd < 3 || fd >= MAX_FDS {
+        return u64::MAX;
+    }
+    unsafe {
+        if FD_TABLE[fd].is_some() {
+            FD_TABLE[fd] = None;
+            0
+        } else {
+            u64::MAX
+        }
+    }
+}
+
+/// sys_stat(path_ptr, path_len) -> file size or u64::MAX on error
+fn sys_stat(path_ptr: u64, path_len: u64) -> u64 {
+    let len = path_len as usize;
+    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
+    let path_str = match core::str::from_utf8(slice) {
+        Ok(s) => s,
+        Err(_) => return u64::MAX,
+    };
+
+    let (dir_path, filename) = parse_file_path(path_str);
+
+    let fs = FS.lock();
+    match fs.read(&dir_path, &filename) {
+        Some(data) => data.len() as u64,
+        None => u64::MAX,
+    }
+}
+
+/// Parse a path like "/docs/info.txt" into (dir_components, filename)
+fn parse_file_path(path: &str) -> (Vec<String>, String) {
+    let path = path.trim_start_matches('/');
+    let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+
+    if parts.is_empty() {
+        return (Vec::new(), String::new());
+    }
+
+    let filename = String::from(*parts.last().unwrap());
+    let dir: Vec<String> = parts[..parts.len() - 1].iter().map(|s| String::from(*s)).collect();
+    (dir, filename)
+}
+
 ```
 
 src/kernel/syscall/mod.rs
-
 ```rust
 pub mod handlers;
 pub mod userprogs;
@@ -3665,7 +4131,6 @@ unsafe extern "C" fn syscall_entry_asm() {
 ```
 
 src/kernel/syscall/userprogs.rs
-
 ```rust
 /// Pre-compiled user-mode programs (raw x86_64 machine code).
 /// These use the syscall instruction to communicate with the kernel.
@@ -3792,68 +4257,54 @@ pub fn run_user_counter() {
 ```
 
 src/kernel/task/context.rs
-
 ```rust
-/// CPU context for cooperative task switching.
-/// Only callee-saved registers need to be preserved across function calls.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct Context {
     pub rsp: u64,
-    pub rbp: u64,
-    pub rbx: u64,
-    pub r12: u64,
-    pub r13: u64,
-    pub r14: u64,
-    pub r15: u64,
-    pub rflags: u64,
 }
 
 impl Context {
     pub const fn empty() -> Self {
         Context {
             rsp: 0,
-            rbp: 0,
-            rbx: 0,
-            r12: 0,
-            r13: 0,
-            r14: 0,
-            r15: 0,
-            rflags: 0x200, // interrupts enabled
         }
     }
 }
 
-/// Switch from `old` context to `new` context.
-/// Saves callee-saved registers into `old`, restores from `new`.
+/// Switch between two tasks by saving/restoring callee-saved registers and RSP.
+///
+/// This saves rbp, rbx, r12-r15 on the old stack, saves the old RSP,
+/// loads the new RSP, restores callee-saved regs, and returns to wherever
+/// the new task's stack says (via `ret`).
 ///
 /// # Safety
-/// Both contexts must be valid and the `new` context's RSP must point to
-/// a valid stack with a return address at the top.
+/// Both context pointers must be valid. The new context's RSP must point
+/// to a valid stack with the correct layout.
 #[naked]
 pub unsafe extern "C" fn switch_context(old: *mut Context, new: *const Context) {
     core::arch::asm!(
-        // Save callee-saved registers into old context
-        "mov [rdi + 0x00], rsp",
-        "mov [rdi + 0x08], rbp",
-        "mov [rdi + 0x10], rbx",
-        "mov [rdi + 0x18], r12",
-        "mov [rdi + 0x20], r13",
-        "mov [rdi + 0x28], r14",
-        "mov [rdi + 0x30], r15",
-        "pushfq",
-        "pop qword ptr [rdi + 0x38]",
+        // Save callee-saved registers on old stack
+        "push rbp",
+        "push rbx",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
 
-        // Restore callee-saved registers from new context
-        "push qword ptr [rsi + 0x38]",
-        "popfq",
-        "mov rsp, [rsi + 0x00]",
-        "mov rbp, [rsi + 0x08]",
-        "mov rbx, [rsi + 0x10]",
-        "mov r12, [rsi + 0x18]",
-        "mov r13, [rsi + 0x20]",
-        "mov r14, [rsi + 0x28]",
-        "mov r15, [rsi + 0x30]",
+        // Save old RSP
+        "mov [rdi], rsp",
+
+        // Load new RSP
+        "mov rsp, [rsi]",
+
+        // Restore callee-saved registers from new stack
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rbx",
+        "pop rbp",
 
         "ret",
         options(noreturn)
@@ -3863,7 +4314,6 @@ pub unsafe extern "C" fn switch_context(old: *mut Context, new: *const Context) 
 ```
 
 src/kernel/task/mod.rs
-
 ```rust
 pub mod context;
 pub mod scheduler;
@@ -3873,7 +4323,6 @@ pub use scheduler::{yield_now, spawn, exit_current_task, TaskId, TaskState, SCHE
 ```
 
 src/kernel/task/scheduler.rs
-
 ```rust
 use alloc::vec::Vec;
 use alloc::boxed::Box;
@@ -3882,6 +4331,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::context::{Context, switch_context};
 
 const TASK_STACK_SIZE: usize = 4096 * 4; // 16 KiB per task
+const DEFAULT_QUANTUM: u32 = 10; // 10 ticks = 100ms at 100Hz
 
 static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -3900,11 +4350,17 @@ pub struct Task {
     pub state: TaskState,
     pub context: Context,
     pub name: &'static str,
+    pub quantum_remaining: u32,
     _stack: Option<Box<[u8]>>,
 }
 
 impl Task {
     /// Create a new task with its own stack that will execute `entry_fn`.
+    ///
+    /// Stack layout (low address → high address):
+    ///   [r15=0, r14=0, r13=0, r12=entry_fn, rbx=0, rbp=0, ret_addr=trampoline]
+    ///
+    /// This matches what `switch_context` expects: it pops r15..rbp then `ret`.
     pub fn new(name: &'static str, entry_fn: fn()) -> Self {
         let id = TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed));
 
@@ -3912,42 +4368,60 @@ impl Task {
         let stack = Box::new([0u8; TASK_STACK_SIZE]);
         let stack_top = stack.as_ptr() as u64 + TASK_STACK_SIZE as u64;
 
-        // Set up the stack so that `ret` from switch_context jumps to task_entry_trampoline,
-        // which calls entry_fn. We put a return address on the stack.
-        // The stack must be 16-byte aligned before the call, and the return address
-        // pushes 8 bytes, so we align to 16 then subtract 8 for the return addr.
-        let aligned_top = stack_top & !0xF; // 16-byte align
-        let rsp = aligned_top - 8; // space for return address
+        // Build the initial stack frame for switch_context
+        // switch_context does: pop r15, r14, r13, r12, rbx, rbp, ret
+        // So we push in reverse order: ret_addr, rbp, rbx, r12, r13, r14, r15
+        let mut rsp = stack_top;
 
-        // Write the entry trampoline address as the return address
-        unsafe {
-            let ret_addr_ptr = rsp as *mut u64;
-            *ret_addr_ptr = task_entry_trampoline as u64;
-        }
+        // Return address — where `ret` in switch_context will jump to
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = task_entry_trampoline as u64; }
+
+        // rbp = 0
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = 0; }
+
+        // rbx = 0
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = 0; }
+
+        // r12 = entry_fn pointer (trampoline reads this)
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = entry_fn as u64; }
+
+        // r13 = 0
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = 0; }
+
+        // r14 = 0
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = 0; }
+
+        // r15 = 0 (switch_context pops this first)
+        rsp -= 8;
+        unsafe { *(rsp as *mut u64) = 0; }
 
         let mut ctx = Context::empty();
         ctx.rsp = rsp;
-        ctx.rbp = 0;
-        // Store the actual entry function pointer in r12 so the trampoline can call it
-        ctx.r12 = entry_fn as u64;
 
         Task {
             id,
             state: TaskState::Ready,
             context: ctx,
             name,
+            quantum_remaining: DEFAULT_QUANTUM,
             _stack: Some(stack),
         }
     }
 
     /// Create a "virtual" task representing the currently running kernel thread (task 0).
-    /// Its context will be filled in when we first switch away from it.
     pub fn kernel_task() -> Self {
         Task {
             id: TaskId(0),
             state: TaskState::Running,
             context: Context::empty(),
-            name: "kernel/shell",
+            name: "kernel",
+            quantum_remaining: DEFAULT_QUANTUM,
             _stack: None, // uses the kernel stack
         }
     }
@@ -3955,14 +4429,17 @@ impl Task {
 
 /// Trampoline that reads the entry function from r12 and calls it.
 /// When the function returns, it marks the task as terminated and yields.
-fn task_entry_trampoline() {
-    // r12 contains the entry function pointer, set by Task::new
+extern "C" fn task_entry_trampoline() {
+    // Re-enable interrupts — we may have been switched to from a timer handler
+    // where interrupts were disabled.
+    x86_64::instructions::interrupts::enable();
+
+    // R12 holds the function pointer (set up by Task::new)
     let entry_fn: fn();
     unsafe {
         core::arch::asm!("mov {}, r12", out(reg) entry_fn);
     }
     entry_fn();
-    // Task is done - mark as terminated and yield forever
     exit_current_task();
 }
 
@@ -3989,11 +4466,35 @@ impl Scheduler {
         id
     }
 
-    pub fn schedule(&mut self) {
+    /// Decide whether to switch tasks (preemptive path).
+    /// Decrements the quantum; if expired, finds the next ready task.
+    /// Returns context pointers for the switch, or None if no switch needed.
+    pub fn schedule_preempt(&mut self) -> Option<(*mut Context, *const Context)> {
         if self.tasks.len() <= 1 {
-            return;
+            return None;
         }
 
+        // Decrement quantum for current task
+        if self.tasks[self.current].quantum_remaining > 0 {
+            self.tasks[self.current].quantum_remaining -= 1;
+            if self.tasks[self.current].quantum_remaining > 0 {
+                return None; // still has time left
+            }
+        }
+
+        self.find_and_switch()
+    }
+
+    /// Cooperative yield: always try to switch to next task.
+    pub fn schedule_yield(&mut self) -> Option<(*mut Context, *const Context)> {
+        if self.tasks.len() <= 1 {
+            return None;
+        }
+        self.find_and_switch()
+    }
+
+    /// Find the next runnable task and prepare context pointers for switching.
+    fn find_and_switch(&mut self) -> Option<(*mut Context, *const Context)> {
         let old_idx = self.current;
 
         // Find next ready task (round-robin)
@@ -4007,13 +4508,16 @@ impl Scheduler {
             }
             next_idx = (next_idx + 1) % self.tasks.len();
             if next_idx == start {
-                // No other runnable task, stay on current
-                return;
+                // No other runnable task — reset quantum and stay
+                self.tasks[old_idx].quantum_remaining = DEFAULT_QUANTUM;
+                return None;
             }
         }
 
         if next_idx == old_idx {
-            return;
+            // Only one runnable task — reset quantum and stay
+            self.tasks[old_idx].quantum_remaining = DEFAULT_QUANTUM;
+            return None;
         }
 
         // Update states
@@ -4021,13 +4525,22 @@ impl Scheduler {
             self.tasks[old_idx].state = TaskState::Ready;
         }
         self.tasks[next_idx].state = TaskState::Running;
+        self.tasks[next_idx].quantum_remaining = DEFAULT_QUANTUM;
         self.current = next_idx;
 
         let old_ctx = &mut self.tasks[old_idx].context as *mut Context;
         let new_ctx = &self.tasks[next_idx].context as *const Context;
 
-        unsafe {
-            switch_context(old_ctx, new_ctx);
+        Some((old_ctx, new_ctx))
+    }
+
+    /// Legacy cooperative schedule (calls switch_context internally).
+    /// Used only by yield_now for backward compat.
+    pub fn schedule(&mut self) {
+        if let Some((old_ctx, new_ctx)) = self.schedule_yield() {
+            unsafe {
+                switch_context(old_ctx, new_ctx);
+            }
         }
     }
 
@@ -4070,20 +4583,38 @@ lazy_static::lazy_static! {
     pub static ref SCHEDULER: Mutex<Scheduler> = Mutex::new(Scheduler::new());
 }
 
+impl Scheduler {
+    pub unsafe fn force_unlock() {
+        SCHEDULER.force_unlock();
+    }
+}
+
 /// Yield the CPU to the next ready task (cooperative).
 pub fn yield_now() {
-    // Disable interrupts during scheduling to prevent deadlocks
     x86_64::instructions::interrupts::without_interrupts(|| {
-        SCHEDULER.lock().schedule();
+        let switch = {
+            let mut sched = SCHEDULER.lock();
+            sched.schedule_yield()
+        }; // lock dropped here
+
+        if let Some((old_ctx, new_ctx)) = switch {
+            unsafe { switch_context(old_ctx, new_ctx); }
+        }
     });
 }
 
 /// Mark the current task as terminated and yield.
 pub fn exit_current_task() -> ! {
     x86_64::instructions::interrupts::without_interrupts(|| {
-        let mut sched = SCHEDULER.lock();
-        sched.terminate_current();
-        sched.schedule();
+        let switch = {
+            let mut sched = SCHEDULER.lock();
+            sched.terminate_current();
+            sched.schedule_yield()
+        }; // lock dropped
+
+        if let Some((old_ctx, new_ctx)) = switch {
+            unsafe { switch_context(old_ctx, new_ctx); }
+        }
     });
     // Should never reach here, but just in case
     loop {
@@ -4101,12 +4632,11 @@ pub fn spawn(name: &'static str, entry_fn: fn()) -> TaskId {
 ```
 
 src/kernel/timer.rs
-
 ```rust
 use core::sync::atomic::{AtomicU64, Ordering};
 use x86_64::structures::idt::InterruptStackFrame;
-
 use crate::kernel::pic::{InterruptIndex, PICS};
+use crate::kernel::task::context::switch_context;
 
 pub const TIMER_HZ: u32 = 100;
 static TICKS: AtomicU64 = AtomicU64::new(0);
@@ -4153,7 +4683,61 @@ impl core::fmt::Write for FmtBuf {
     }
 }
 
+/// Naked interrupt handler for Timer.
+/// Saves context, calls rust handler, schedules, restores context.
+#[naked]
 pub extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        core::arch::asm!(
+            // 1. Save all GPRs (except RSP which is already saved by CPU)
+            "push rax",
+            "push rbx",
+            "push rcx",
+            "push rdx",
+            "push rsi",
+            "push rdi",
+            "push rbp",
+            "push r8",
+            "push r9",
+            "push r10",
+            "push r11",
+            "push r12",
+            "push r13",
+            "push r14",
+            "push r15",
+
+            // 2. Call Rust handler to update ticks and ACK PIC
+            "call rust_timer_handler",
+
+            // 3. Call Scheduler to switch tasks (preemptive)
+            "call scheduler_schedule",
+
+            // 4. Restore all GPRs
+            "pop r15",
+            "pop r14",
+            "pop r13",
+            "pop r12",
+            "pop r11",
+            "pop r10",
+            "pop r9",
+            "pop r8",
+            "pop rbp",
+            "pop rdi",
+            "pop rsi",
+            "pop rdx",
+            "pop rcx",
+            "pop rbx",
+            "pop rax",
+
+            // 5. Return from interrupt
+            "iretq",
+            options(noreturn)
+        );
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn rust_timer_handler() {
     let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
 
     // Only update VGA text status bar when NOT in GUI mode
@@ -4176,10 +4760,29 @@ pub extern "x86-interrupt" fn timer_interrupt_handler(_stack_frame: InterruptSta
     }
 }
 
+/// Preemptive scheduler entry point called from the timer interrupt handler.
+/// Uses try_lock to avoid deadlocks — if the scheduler is already locked
+/// (e.g., during yield_now or spawn), we simply skip this tick.
+#[no_mangle]
+pub extern "C" fn scheduler_schedule() {
+    use crate::kernel::task::SCHEDULER;
+
+    let switch = {
+        if let Some(mut sched) = SCHEDULER.try_lock() {
+            sched.schedule_preempt()
+        } else {
+            return; // scheduler busy, skip this tick
+        }
+    }; // lock dropped here — BEFORE context switch
+
+    if let Some((old_ctx, new_ctx)) = switch {
+        unsafe { switch_context(old_ctx, new_ctx); }
+    }
+}
+
 ```
 
 src/lib.rs
-
 ```rust
 #![no_std]
 #![feature(abi_x86_interrupt)]
@@ -4193,14 +4796,28 @@ pub mod fs;
 pub mod shell;
 pub mod gui;
 
+/// Early init: GDT, IDT, PICs, timer, syscall. No heap required.
 pub fn init() {
+    serial_println!("[INIT] GDT...");
     kernel::gdt::init();
+    serial_println!("[INIT] IDT...");
     kernel::idt::init_idt();
+    serial_println!("[INIT] PICs...");
     unsafe { kernel::pic::PICS.lock().initialize() };
+    serial_println!("[INIT] Timer...");
     kernel::timer::init_timer();
+    serial_println!("[INIT] Syscall...");
     kernel::syscall::init();
+    serial_println!("[INIT] Early init done");
+}
+
+/// Late init: requires heap. Enables interrupts and initializes drivers.
+pub fn init_late() {
+    serial_println!("[INIT] Enabling interrupts...");
     x86_64::instructions::interrupts::enable();
+    serial_println!("[INIT] ATA...");
     drivers::ata::init();
+    serial_println!("[INIT] All done");
 }
 
 pub fn hlt_loop() -> ! {
@@ -4211,6 +4828,7 @@ pub fn hlt_loop() -> ! {
 
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
+    serial_println!("[PANIC] {}", info);
     println!("{}", info);
     hlt_loop()
 }
@@ -4218,7 +4836,6 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 ```
 
 src/main.rs
-
 ```rust
 #![no_std]
 #![no_main]
@@ -4232,9 +4849,12 @@ entry_point!(kernel_main);
 
 fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Initialize GDT, IDT, PICs
+    systemoperacyjny::serial_println!("[BOOT] Starting init...");
     systemoperacyjny::init();
+    systemoperacyjny::serial_println!("[BOOT] Init done");
 
     // Initialize memory management
+    systemoperacyjny::serial_println!("[BOOT] Setting up memory...");
     let phys_mem_offset = x86_64::VirtAddr::new(boot_info.physical_memory_offset);
     let mut mapper = unsafe { paging::init(phys_mem_offset) };
     let mut frame_allocator = unsafe { frame_allocator::BootInfoFrameAllocator::init(&boot_info.memory_map) };
@@ -4242,47 +4862,56 @@ fn kernel_main(boot_info: &'static BootInfo) -> ! {
     // Initialize heap
     heap::init_heap(&mut mapper, &mut frame_allocator)
         .expect("heap initialization failed");
+    systemoperacyjny::serial_println!("[BOOT] Heap ready");
+
+    // Save to global memory manager
+    {
+        let mut mm = systemoperacyjny::kernel::memory::MEMORY_MANAGER.lock();
+        mm.mapper = Some(mapper);
+        mm.frame_allocator = Some(frame_allocator);
+    }
+    systemoperacyjny::serial_println!("[BOOT] Memory manager saved");
+
+    // Late init: enable interrupts + ATA (requires heap)
+    systemoperacyjny::init_late();
 
     // Initialize filesystem with sample files
     systemoperacyjny::fs::init();
+    systemoperacyjny::serial_println!("[BOOT] Filesystem initialized");
 
     // Launch GUI
+    systemoperacyjny::serial_println!("[BOOT] Launching GUI...");
     systemoperacyjny::gui::run()
 }
 
 ```
 
 src/shell/commands.rs
-
 ```rust
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::{print, println, shell_error};
+use alloc::format;
 use crate::fs::{FS, FileSystem, RemoveResult};
-use crate::drivers::vga;
 
-pub fn execute(line: &str, cwd: &mut Vec<String>) {
-    let (cmd, args) = match line.split_once(' ') {
-        Some((c, a)) => (c, a),
-        None => (line, ""),
-    };
-
+/// Execute a single command and return its output as a String.
+/// `pipe_input` is the output of the previous command in a pipeline (if any).
+pub fn run_command(cmd: &str, args: &str, cwd: &mut Vec<String>, pipe_input: Option<&str>) -> String {
     match cmd {
         "help" => cmd_help(),
         "echo" => cmd_echo(args),
-        "clear" => cmd_clear(),
+        "clear" => { crate::drivers::vga::clear_screen(); String::new() }
         "ls" => cmd_ls(cwd),
         "cat" => cmd_cat(args, cwd),
         "touch" => cmd_touch(args, cwd),
         "write" => cmd_write(args, cwd),
         "rm" => cmd_rm(args, cwd),
         "mkdir" => cmd_mkdir(args, cwd),
-        "cd" => cmd_cd(args, cwd),
+        "cd" => { cmd_cd(args, cwd); String::new() }
         "pwd" => cmd_pwd(cwd),
         "uptime" => cmd_uptime(),
         "info" => cmd_info(),
-        "grep" => cmd_grep(args, cwd),
-        "wc" => cmd_wc(args, cwd),
+        "grep" => cmd_grep(args, cwd, pipe_input),
+        "wc" => cmd_wc(args, cwd, pipe_input),
         "cp" => cmd_cp(args, cwd),
         "mv" => cmd_mv(args, cwd),
         "hexdump" => cmd_hexdump(args, cwd),
@@ -4291,161 +4920,163 @@ pub fn execute(line: &str, cwd: &mut Vec<String>) {
         "ps" => cmd_ps(),
         "spawn" => cmd_spawn(args),
         "kill" => cmd_kill(args),
-        "exec" => cmd_exec(args),
-        _ => {
-            shell_error!("Nieznana komenda: '{}'. Wpisz 'help' aby zobaczyc liste komend.", cmd);
-        }
+        "exec" => cmd_exec(args, cwd),
+        "fatls" => cmd_fatls(),
+        "env" => cmd_env(),
+        "export" => cmd_export(args),
+        "head" => cmd_head(args, cwd, pipe_input),
+        "tail" => cmd_tail(args, cwd, pipe_input),
+        "sort" => cmd_sort(args, cwd, pipe_input),
+        "uniq" => cmd_uniq(pipe_input),
+        "keymap" => cmd_keymap(args),
+        _ => format!("Nieznana komenda: '{}'. Wpisz 'help' aby zobaczyc liste komend.", cmd),
     }
 }
 
-fn cmd_help() {
-    vga::set_color(vga::Color::Yellow, vga::Color::Black);
-    println!("Dostepne komendy:");
-    vga::set_color(vga::Color::White, vga::Color::Black);
-    println!("  help              - Wyswietl te pomoc");
-    println!("  echo <tekst>      - Wyswietl tekst");
-    println!("  clear             - Wyczysc ekran");
-    println!("  ls                - Lista plikow i katalogow");
-    println!("  cat <plik>        - Wyswietl zawartosc pliku");
-    println!("  touch <plik>      - Utworz pusty plik");
-    println!("  write <plik> <t>  - Zapisz tekst do pliku");
-    println!("  rm <nazwa>        - Usun plik lub pusty katalog");
-    println!("  mkdir <nazwa>     - Utworz katalog");
-    println!("  cd <katalog>      - Zmien katalog (cd .. / cd /)");
-    println!("  pwd               - Wyswietl biezacy katalog");
-    println!("  grep <wz> <plik>  - Szukaj wzorca w pliku");
-    println!("  wc <plik>         - Policz linie/slowa/bajty");
-    println!("  cp <src> <dst>    - Kopiuj plik");
-    println!("  mv <src> <dst>    - Przenies/zmien nazwe pliku");
-    println!("  hexdump <plik>    - Zrzut szesnastkowy pliku");
-    println!("  save              - Zapisz FS na dysk ATA");
-    println!("  load              - Wczytaj FS z dysku ATA");
-    println!("  uptime            - Czas dzialania systemu");
-    println!("  info              - Informacje systemowe");
-    println!("  ps                - Lista procesow/taskow");
-    println!("  spawn <nazwa>     - Uruchom demo task");
-    println!("  kill <id>         - Zakoncz task o podanym ID");
-    println!("  exec <program>    - Uruchom program uzytkownika");
-    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+fn cmd_fatls() -> String {
+    let files = crate::fs::fat::list_root_files();
+    if files.is_empty() {
+        return String::from("(brak plikow lub blad odczytu)");
+    }
+    let mut s = String::from("Pliki na dysku FAT (root):\n");
+    for f in files {
+        s.push_str(&format!("  {}\n", f));
+    }
+    if s.ends_with('\n') { s.pop(); }
+    s
 }
 
-fn cmd_echo(args: &str) {
-    println!("{}", args);
+fn cmd_help() -> String {
+    let mut s = String::new();
+    s.push_str("Dostepne komendy:\n");
+    s.push_str("  help              - Wyswietl te pomoc\n");
+    s.push_str("  echo <tekst>      - Wyswietl tekst\n");
+    s.push_str("  clear             - Wyczysc ekran\n");
+    s.push_str("  ls                - Lista plikow i katalogow\n");
+    s.push_str("  cat <plik>        - Wyswietl zawartosc pliku\n");
+    s.push_str("  touch <plik>      - Utworz pusty plik\n");
+    s.push_str("  write <plik> <t>  - Zapisz tekst do pliku\n");
+    s.push_str("  rm <nazwa>        - Usun plik lub pusty katalog\n");
+    s.push_str("  mkdir <nazwa>     - Utworz katalog\n");
+    s.push_str("  cd <katalog>      - Zmien katalog (cd .. / cd /)\n");
+    s.push_str("  pwd               - Wyswietl biezacy katalog\n");
+    s.push_str("  grep <wz> <plik>  - Szukaj wzorca w pliku\n");
+    s.push_str("  wc [plik]         - Policz linie/slowa/bajty\n");
+    s.push_str("  cp <src> <dst>    - Kopiuj plik\n");
+    s.push_str("  mv <src> <dst>    - Przenies/zmien nazwe pliku\n");
+    s.push_str("  hexdump <plik>    - Zrzut szesnastkowy pliku\n");
+    s.push_str("  head [-n N] [plik]- Pokaz pierwszych N linii\n");
+    s.push_str("  tail [-n N] [plik]- Pokaz ostatnich N linii\n");
+    s.push_str("  sort [plik]       - Sortuj linie\n");
+    s.push_str("  uniq              - Usun powtorzenia (pipe)\n");
+    s.push_str("  save              - Zapisz FS na dysk ATA\n");
+    s.push_str("  load              - Wczytaj FS z dysku ATA\n");
+    s.push_str("  uptime            - Czas dzialania systemu\n");
+    s.push_str("  info              - Informacje systemowe\n");
+    s.push_str("  ps                - Lista procesow/taskow\n");
+    s.push_str("  spawn <nazwa>     - Uruchom demo task\n");
+    s.push_str("  kill <id>         - Zakoncz task o podanym ID\n");
+    s.push_str("  exec <program>    - Uruchom program uzytkownika\n");
+    s.push_str("  env               - Pokaz zmienne srodowiskowe\n");
+    s.push_str("  export K=V        - Ustaw zmienna srodowiskowa\n");
+    s.push_str("  fatls             - Lista plikow FAT32\n");
+    s.push_str("  keymap [layout]   - Pokaz/zmien layout klawiatury\n");
+    s.push_str("Pipe: cmd1 | cmd2   Redirect: cmd > plik, >> plik, < plik");
+    s
 }
 
-fn cmd_clear() {
-    vga::clear_screen();
+fn cmd_echo(args: &str) -> String {
+    String::from(args)
 }
 
-fn cmd_ls(cwd: &[String]) {
+fn cmd_ls(cwd: &[String]) -> String {
     let fs = FS.lock();
     match fs.list(cwd) {
         Some(entries) => {
             if entries.is_empty() {
-                println!("(pusty katalog)");
-            } else {
-                for entry in &entries {
-                    if entry.is_dir {
-                        vga::set_color(vga::Color::LightBlue, vga::Color::Black);
-                        println!("  {}/", entry.name);
-                        vga::set_color(vga::Color::LightGreen, vga::Color::Black);
-                    } else {
-                        println!("  {} ({} bajtow)", entry.name, entry.size);
-                    }
+                return String::from("(pusty katalog)");
+            }
+            let mut s = String::new();
+            for entry in &entries {
+                if entry.is_dir {
+                    s.push_str(&format!("  {}/\n", entry.name));
+                } else {
+                    s.push_str(&format!("  {} ({} bajtow)\n", entry.name, entry.size));
                 }
             }
+            if s.ends_with('\n') { s.pop(); }
+            s
         }
-        None => {
-            shell_error!("Katalog nie istnieje.");
-        }
+        None => String::from("Katalog nie istnieje."),
     }
 }
 
-fn cmd_cat(args: &str, cwd: &[String]) {
+fn cmd_cat(args: &str, cwd: &[String]) -> String {
     let name = match args.split_whitespace().next() {
         Some(n) => n,
-        None => {
-            println!("Uzycie: cat <nazwa_pliku>");
-            return;
-        }
+        None => return String::from("Uzycie: cat <nazwa_pliku>"),
     };
     let fs = FS.lock();
     match fs.read(cwd, name) {
         Some(data) => {
-            let text = core::str::from_utf8(data).unwrap_or("<dane binarne>");
-            println!("{}", text);
+            String::from(core::str::from_utf8(data).unwrap_or("<dane binarne>"))
         }
-        None => {
-            shell_error!("Plik '{}' nie istnieje.", name);
-        }
+        None => format!("Plik '{}' nie istnieje.", name),
     }
 }
 
-fn cmd_touch(args: &str, cwd: &[String]) {
+fn cmd_touch(args: &str, cwd: &[String]) -> String {
     let name = match args.split_whitespace().next() {
         Some(n) => n,
-        None => {
-            println!("Uzycie: touch <nazwa_pliku>");
-            return;
-        }
+        None => return String::from("Uzycie: touch <nazwa_pliku>"),
     };
     let mut fs = FS.lock();
     if fs.create(cwd, name) {
-        println!("Utworzono plik '{}'.", name);
+        format!("Utworzono plik '{}'.", name)
     } else {
-        println!("'{}' juz istnieje.", name);
+        format!("'{}' juz istnieje.", name)
     }
 }
 
-fn cmd_write(args: &str, cwd: &[String]) {
+fn cmd_write(args: &str, cwd: &[String]) -> String {
     let (name, content) = match args.split_once(' ') {
         Some((n, c)) => (n, c),
-        None => {
-            println!("Uzycie: write <nazwa_pliku> <tekst>");
-            return;
-        }
+        None => return String::from("Uzycie: write <nazwa_pliku> <tekst>"),
     };
     if name.is_empty() {
-        println!("Uzycie: write <nazwa_pliku> <tekst>");
-        return;
+        return String::from("Uzycie: write <nazwa_pliku> <tekst>");
     }
     let mut fs = FS.lock();
     if fs.write(cwd, name, content.as_bytes()) {
-        println!("Zapisano {} bajtow do '{}'.", content.len(), name);
+        format!("Zapisano {} bajtow do '{}'.", content.len(), name)
     } else {
-        shell_error!("Nie mozna zapisac do '{}'.", name);
+        format!("Nie mozna zapisac do '{}'.", name)
     }
 }
 
-fn cmd_rm(args: &str, cwd: &[String]) {
+fn cmd_rm(args: &str, cwd: &[String]) -> String {
     let name = match args.split_whitespace().next() {
         Some(n) => n,
-        None => {
-            println!("Uzycie: rm <nazwa>");
-            return;
-        }
+        None => return String::from("Uzycie: rm <nazwa>"),
     };
     let mut fs = FS.lock();
     match fs.remove(cwd, name) {
-        RemoveResult::Ok => println!("Usunieto '{}'.", name),
-        RemoveResult::NotFound => shell_error!("'{}' nie istnieje.", name),
-        RemoveResult::DirNotEmpty => shell_error!("Katalog '{}' nie jest pusty.", name),
+        RemoveResult::Ok => format!("Usunieto '{}'.", name),
+        RemoveResult::NotFound => format!("'{}' nie istnieje.", name),
+        RemoveResult::DirNotEmpty => format!("Katalog '{}' nie jest pusty.", name),
     }
 }
 
-fn cmd_mkdir(args: &str, cwd: &[String]) {
+fn cmd_mkdir(args: &str, cwd: &[String]) -> String {
     let name = match args.split_whitespace().next() {
         Some(n) => n,
-        None => {
-            println!("Uzycie: mkdir <nazwa>");
-            return;
-        }
+        None => return String::from("Uzycie: mkdir <nazwa>"),
     };
     let mut fs = FS.lock();
     if fs.mkdir(cwd, name) {
-        println!("Utworzono katalog '{}'.", name);
+        format!("Utworzono katalog '{}'.", name)
     } else {
-        shell_error!("'{}' juz istnieje.", name);
+        format!("'{}' juz istnieje.", name)
     }
 }
 
@@ -4466,206 +5097,199 @@ fn cmd_cd(args: &str, cwd: &mut Vec<String>) {
             let is_dir = {
                 let fs = FS.lock();
                 if !fs.exists(cwd, name) {
-                    shell_error!("'{}' nie istnieje.", name);
                     return;
                 }
                 fs.is_dir(cwd, name)
             };
             if is_dir {
                 cwd.push(String::from(name));
-            } else {
-                shell_error!("'{}' nie jest katalogiem.", name);
             }
         }
     }
 }
 
-fn cmd_pwd(cwd: &[String]) {
+fn cmd_pwd(cwd: &[String]) -> String {
     if cwd.is_empty() {
-        println!("/");
+        String::from("/")
     } else {
+        let mut s = String::new();
         for component in cwd {
-            print!("/{}", component);
+            s.push('/');
+            s.push_str(component);
         }
-        println!();
+        s
     }
 }
 
-fn cmd_uptime() {
+fn cmd_uptime() -> String {
     let t = crate::kernel::timer::ticks();
     let hz = crate::kernel::timer::TIMER_HZ as u64;
     let total_secs = t / hz;
     let hours = total_secs / 3600;
     let minutes = (total_secs % 3600) / 60;
     let secs = total_secs % 60;
-    println!("Uptime: {}h {:02}m {:02}s ({} tickow @ {}Hz)", hours, minutes, secs, t, hz);
+    format!("Uptime: {}h {:02}m {:02}s ({} tickow @ {}Hz)", hours, minutes, secs, t, hz)
 }
 
-fn cmd_info() {
+fn cmd_info() -> String {
     let (heap_used, heap_free) = crate::kernel::memory::heap::heap_stats();
     let total_kb = (heap_used + heap_free) / 1024;
     let used_kb = heap_used / 1024;
 
-    vga::set_color(vga::Color::Yellow, vga::Color::Black);
-    println!("=== Informacje systemowe ===");
-    vga::set_color(vga::Color::White, vga::Color::Black);
-    println!("  System:        PolarOs v0.1.0");
-    println!("  Architektura:  x86_64");
-    println!("  Jezyk:         Rust (nightly)");
-    println!("  Tryb wideo:    VGA tekst 80x25");
-    println!("  Klawiatura:    PS/2 (IRQ1)");
-    println!("  Heap:          {}/{} KiB", used_kb, total_kb);
-    println!("  Filesystem:    RamFs (drzewo katalogow)");
-    println!("  Dysk ATA:      {}", if crate::drivers::ata::is_available() { "dostepny" } else { "niedostepny" });
-    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+    let mut s = String::new();
+    s.push_str("=== Informacje systemowe ===\n");
+    s.push_str("  System:        PolarOs v0.1.0\n");
+    s.push_str("  Architektura:  x86_64\n");
+    s.push_str("  Jezyk:         Rust (nightly)\n");
+    s.push_str("  Klawiatura:    PS/2 (IRQ1)\n");
+    s.push_str(&format!("  Heap:          {}/{} KiB\n", used_kb, total_kb));
+    s.push_str("  Filesystem:    RamFs (drzewo katalogow)\n");
+    s.push_str(&format!("  Dysk ATA:      {}", if crate::drivers::ata::is_available() { "dostepny" } else { "niedostepny" }));
+    s
 }
 
-fn cmd_grep(args: &str, cwd: &[String]) {
-    let (pattern, filename) = match args.split_once(' ') {
-        Some((p, f)) => (p, f.trim()),
-        None => {
-            println!("Uzycie: grep <wzorzec> <plik>");
-            return;
+fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let pattern = match parts.first() {
+        Some(p) => *p,
+        None => return String::from("Uzycie: grep <wzorzec> [plik]"),
+    };
+
+    let text = if let Some(input) = pipe_input {
+        String::from(input)
+    } else {
+        let filename = match parts.get(1) {
+            Some(f) => *f,
+            None => return String::from("Uzycie: grep <wzorzec> <plik>"),
+        };
+        let fs = FS.lock();
+        match fs.read(cwd, filename) {
+            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
+            None => return format!("Plik '{}' nie istnieje.", filename),
         }
     };
-    let fs = FS.lock();
-    match fs.read(cwd, filename) {
-        Some(data) => {
-            let text = core::str::from_utf8(data).unwrap_or("");
-            let mut found = false;
-            for line in text.lines() {
-                if line.contains(pattern) {
-                    println!("{}", line);
-                    found = true;
-                }
-            }
-            if !found {
-                println!("Brak wynikow dla '{}'.", pattern);
-            }
+
+    let mut result = String::new();
+    for line in text.lines() {
+        if line.contains(pattern) {
+            result.push_str(line);
+            result.push('\n');
         }
-        None => shell_error!("Plik '{}' nie istnieje.", filename),
+    }
+    if result.ends_with('\n') { result.pop(); }
+    if result.is_empty() {
+        format!("Brak wynikow dla '{}'.", pattern)
+    } else {
+        result
     }
 }
 
-fn cmd_wc(args: &str, cwd: &[String]) {
-    let name = match args.split_whitespace().next() {
-        Some(n) => n,
-        None => {
-            println!("Uzycie: wc <plik>");
-            return;
+fn cmd_wc(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
+    let text = if let Some(input) = pipe_input {
+        String::from(input)
+    } else {
+        let name = match args.split_whitespace().next() {
+            Some(n) => n,
+            None => return String::from("Uzycie: wc <plik>"),
+        };
+        let fs = FS.lock();
+        match fs.read(cwd, name) {
+            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
+            None => return format!("Plik '{}' nie istnieje.", name),
         }
     };
-    let fs = FS.lock();
-    match fs.read(cwd, name) {
-        Some(data) => {
-            let bytes = data.len();
-            let text = core::str::from_utf8(data).unwrap_or("");
-            let lines = text.lines().count();
-            let words = text.split_whitespace().count();
-            println!("  {} linii  {} slow  {} bajtow  {}", lines, words, bytes, name);
-        }
-        None => shell_error!("Plik '{}' nie istnieje.", name),
-    }
+
+    let bytes = text.len();
+    let lines = text.lines().count();
+    let words = text.split_whitespace().count();
+    format!("  {} linii  {} slow  {} bajtow", lines, words, bytes)
 }
 
-fn cmd_cp(args: &str, cwd: &[String]) {
+fn cmd_cp(args: &str, cwd: &[String]) -> String {
     let (src, dst) = match args.split_once(' ') {
         Some((s, d)) => (s, d.trim()),
-        None => {
-            println!("Uzycie: cp <zrodlo> <cel>");
-            return;
-        }
+        None => return String::from("Uzycie: cp <zrodlo> <cel>"),
     };
     let data = {
         let fs = FS.lock();
         match fs.read(cwd, src) {
             Some(d) => Vec::from(d),
-            None => {
-                shell_error!("Plik '{}' nie istnieje.", src);
-                return;
-            }
+            None => return format!("Plik '{}' nie istnieje.", src),
         }
     };
     let mut fs = FS.lock();
     if fs.write(cwd, dst, &data) {
-        println!("Skopiowano '{}' -> '{}'.", src, dst);
+        format!("Skopiowano '{}' -> '{}'.", src, dst)
     } else {
-        shell_error!("Nie mozna zapisac do '{}'.", dst);
+        format!("Nie mozna zapisac do '{}'.", dst)
     }
 }
 
-fn cmd_mv(args: &str, cwd: &[String]) {
+fn cmd_mv(args: &str, cwd: &[String]) -> String {
     let (src, dst) = match args.split_once(' ') {
         Some((s, d)) => (s, d.trim()),
-        None => {
-            println!("Uzycie: mv <zrodlo> <cel>");
-            return;
-        }
+        None => return String::from("Uzycie: mv <zrodlo> <cel>"),
     };
     if src == dst {
-        return;
+        return String::new();
     }
     let data = {
         let fs = FS.lock();
         match fs.read(cwd, src) {
             Some(d) => Vec::from(d),
-            None => {
-                shell_error!("Plik '{}' nie istnieje.", src);
-                return;
-            }
+            None => return format!("Plik '{}' nie istnieje.", src),
         }
     };
     let mut fs = FS.lock();
     if fs.write(cwd, dst, &data) {
         fs.remove(cwd, src);
-        println!("Przeniesiono '{}' -> '{}'.", src, dst);
+        format!("Przeniesiono '{}' -> '{}'.", src, dst)
     } else {
-        shell_error!("Nie mozna przeniesc do '{}'.", dst);
+        format!("Nie mozna przeniesc do '{}'.", dst)
     }
 }
 
-fn cmd_hexdump(args: &str, cwd: &[String]) {
+fn cmd_hexdump(args: &str, cwd: &[String]) -> String {
     let name = match args.split_whitespace().next() {
         Some(n) => n,
-        None => {
-            println!("Uzycie: hexdump <plik>");
-            return;
-        }
+        None => return String::from("Uzycie: hexdump <plik>"),
     };
     let fs = FS.lock();
     match fs.read(cwd, name) {
         Some(data) => {
+            let mut s = String::new();
             for (i, chunk) in data.chunks(16).enumerate() {
-                print!("{:08x}  ", i * 16);
+                s.push_str(&format!("{:08x}  ", i * 16));
                 for (j, byte) in chunk.iter().enumerate() {
-                    print!("{:02x} ", byte);
-                    if j == 7 { print!(" "); }
+                    s.push_str(&format!("{:02x} ", byte));
+                    if j == 7 { s.push(' '); }
                 }
                 for j in chunk.len()..16 {
-                    print!("   ");
-                    if j == 7 { print!(" "); }
+                    s.push_str("   ");
+                    if j == 7 { s.push(' '); }
                 }
-                print!(" |");
+                s.push_str(" |");
                 for byte in chunk {
                     if *byte >= 0x20 && *byte <= 0x7e {
-                        print!("{}", *byte as char);
+                        s.push(*byte as char);
                     } else {
-                        print!(".");
+                        s.push('.');
                     }
                 }
-                println!("|");
+                s.push_str("|\n");
             }
+            if s.ends_with('\n') { s.pop(); }
+            s
         }
-        None => shell_error!("Plik '{}' nie istnieje.", name),
+        None => format!("Plik '{}' nie istnieje.", name),
     }
 }
 
-fn cmd_save() {
+fn cmd_save() -> String {
     use crate::drivers::ata;
 
     if !ata::is_available() {
-        shell_error!("Dysk ATA niedostepny.");
-        return;
+        return String::from("Dysk ATA niedostepny.");
     }
 
     let data = {
@@ -4682,8 +5306,7 @@ fn cmd_save() {
     header[8..8 + first_chunk].copy_from_slice(&data[..first_chunk]);
 
     if !ata::write_sector(ata::DATA_START_SECTOR, &header) {
-        shell_error!("Blad zapisu naglowka.");
-        return;
+        return String::from("Blad zapisu naglowka.");
     }
 
     let mut offset = first_chunk;
@@ -4693,35 +5316,31 @@ fn cmd_save() {
         let chunk = (data.len() - offset).min(512);
         buf[..chunk].copy_from_slice(&data[offset..offset + chunk]);
         if !ata::write_sector(sector, &buf) {
-            shell_error!("Blad zapisu sektora {}.", sector);
-            return;
+            return format!("Blad zapisu sektora {}.", sector);
         }
         offset += chunk;
         sector += 1;
     }
 
     let sectors_written = sector - ata::DATA_START_SECTOR;
-    println!("Zapisano {} bajtow ({} sektorow).", data.len(), sectors_written);
+    format!("Zapisano {} bajtow ({} sektorow).", data.len(), sectors_written)
 }
 
-fn cmd_load(cwd: &mut Vec<String>) {
+fn cmd_load(cwd: &mut Vec<String>) -> String {
     use crate::drivers::ata;
     use crate::fs::ramfs::RamFs;
 
     if !ata::is_available() {
-        shell_error!("Dysk ATA niedostepny.");
-        return;
+        return String::from("Dysk ATA niedostepny.");
     }
 
     let mut header = [0u8; 512];
     if !ata::read_sector(ata::DATA_START_SECTOR, &mut header) {
-        shell_error!("Blad odczytu naglowka.");
-        return;
+        return String::from("Blad odczytu naglowka.");
     }
 
     if &header[0..4] != b"PLRS" {
-        shell_error!("Brak zapisanego systemu plikow na dysku.");
-        return;
+        return String::from("Brak zapisanego systemu plikow na dysku.");
     }
 
     let total_len = u32::from_le_bytes([header[4], header[5], header[6], header[7]]) as usize;
@@ -4735,8 +5354,7 @@ fn cmd_load(cwd: &mut Vec<String>) {
     while data.len() < total_len {
         let mut buf = [0u8; 512];
         if !ata::read_sector(sector, &mut buf) {
-            shell_error!("Blad odczytu sektora {}.", sector);
-            return;
+            return format!("Blad odczytu sektora {}.", sector);
         }
         let remaining = total_len - data.len();
         let chunk = remaining.min(512);
@@ -4749,31 +5367,31 @@ fn cmd_load(cwd: &mut Vec<String>) {
             let mut fs = FS.lock();
             fs.replace(new_fs);
             cwd.clear();
-            println!("Wczytano system plikow ({} bajtow).", total_len);
+            format!("Wczytano system plikow ({} bajtow).", total_len)
         }
-        None => {
-            shell_error!("Uszkodzone dane na dysku.");
-        }
+        None => String::from("Uszkodzone dane na dysku."),
     }
 }
 
-fn cmd_ps() {
+fn cmd_ps() -> String {
     use crate::kernel::task::{SCHEDULER, TaskState};
 
-    vga::set_color(vga::Color::Yellow, vga::Color::Black);
-    println!("  ID  STAN         NAZWA");
-    vga::set_color(vga::Color::White, vga::Color::Black);
+    let mut s = String::new();
+    s.push_str("  ID  STAN         NAZWA\n");
 
-    let sched = SCHEDULER.lock();
-    for task in sched.task_list() {
-        let state_str = match task.state {
-            TaskState::Ready => "Ready      ",
-            TaskState::Running => "Running    ",
-            TaskState::Terminated => "Terminated ",
-        };
-        println!("  {:3} {}  {}", task.id.0, state_str, task.name);
-    }
-    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        let sched = SCHEDULER.lock();
+        for task in sched.task_list() {
+            let state_str = match task.state {
+                TaskState::Ready => "Ready      ",
+                TaskState::Running => "Running    ",
+                TaskState::Terminated => "Terminated ",
+            };
+            s.push_str(&format!("  {:3} {}  {}\n", task.id.0, state_str, task.name));
+        }
+    });
+    if s.ends_with('\n') { s.pop(); }
+    s
 }
 
 fn demo_counter() {
@@ -4784,7 +5402,7 @@ fn demo_counter() {
     for i in 0..5 {
         let now = timer::ticks();
         let secs = (now - start) / timer::TIMER_HZ as u64;
-        println!("[demo] Krok {}/5  ({}s od startu)", i + 1, secs);
+        crate::serial_println!("[demo] Krok {}/5  ({}s od startu)", i + 1, secs);
         // Busy-wait ~1 second then yield
         let target = now + timer::TIMER_HZ as u64;
         while timer::ticks() < target {
@@ -4792,7 +5410,7 @@ fn demo_counter() {
         }
         yield_now();
     }
-    println!("[demo] Task zakonczony.");
+    crate::serial_println!("[demo] Task zakonczony.");
 }
 
 fn demo_hello() {
@@ -4800,69 +5418,68 @@ fn demo_hello() {
     use crate::kernel::timer;
 
     for i in 0..3 {
-        println!("[hello] Pozdrowienia nr {} z taska!", i + 1);
+        crate::serial_println!("[hello] Pozdrowienia nr {} z taska!", i + 1);
         let target = timer::ticks() + timer::TIMER_HZ as u64;
         while timer::ticks() < target {
             x86_64::instructions::hlt();
         }
         yield_now();
     }
-    println!("[hello] Koniec.");
+    crate::serial_println!("[hello] Koniec.");
 }
 
-fn cmd_spawn(args: &str) {
+fn cmd_spawn(args: &str) -> String {
     use crate::kernel::task;
 
     let name = args.split_whitespace().next().unwrap_or("counter");
     match name {
         "counter" => {
             let id = task::spawn("demo-counter", demo_counter);
-            println!("Uruchomiono task 'counter' (ID={})", id.0);
+            format!("Uruchomiono task 'counter' (ID={})", id.0)
         }
         "hello" => {
             let id = task::spawn("demo-hello", demo_hello);
-            println!("Uruchomiono task 'hello' (ID={})", id.0);
+            format!("Uruchomiono task 'hello' (ID={})", id.0)
         }
-        _ => {
-            println!("Dostepne demo taski: counter, hello");
-        }
+        _ => String::from("Dostepne demo taski: counter, hello"),
     }
 }
 
-fn cmd_kill(args: &str) {
+fn cmd_kill(args: &str) -> String {
     use crate::kernel::task::{SCHEDULER, TaskId};
 
     let id_str = match args.split_whitespace().next() {
         Some(s) => s,
-        None => {
-            println!("Uzycie: kill <id>");
-            return;
-        }
+        None => return String::from("Uzycie: kill <id>"),
     };
 
     let id: u64 = match id_str.parse() {
         Ok(n) => n,
-        Err(_) => {
-            shell_error!("Nieprawidlowy ID: '{}'", id_str);
-            return;
-        }
+        Err(_) => return format!("Nieprawidlowy ID: '{}'", id_str),
     };
 
     if id == 0 {
-        shell_error!("Nie mozna zabic taska jądra (ID=0).");
-        return;
+        return String::from("Nie mozna zabic taska jadra (ID=0).");
     }
 
-    let mut sched = SCHEDULER.lock();
-    if sched.kill_task(TaskId(id)) {
-        println!("Zakonczono task ID={}.", id);
-        sched.cleanup_terminated();
+    let result = x86_64::instructions::interrupts::without_interrupts(|| {
+        let mut sched = SCHEDULER.lock();
+        if sched.kill_task(TaskId(id)) {
+            sched.cleanup_terminated();
+            true
+        } else {
+            false
+        }
+    });
+
+    if result {
+        format!("Zakonczono task ID={}.", id)
     } else {
-        shell_error!("Nie znaleziono aktywnego taska o ID={}.", id);
+        format!("Nie znaleziono aktywnego taska o ID={}.", id)
     }
 }
 
-fn cmd_exec(args: &str) {
+fn cmd_exec(args: &str, cwd: &[String]) -> String {
     use crate::kernel::task;
     use crate::kernel::syscall::userprogs;
 
@@ -4870,23 +5487,277 @@ fn cmd_exec(args: &str) {
     match name {
         "hello" => {
             let id = task::spawn("user-hello", userprogs::run_user_hello);
-            println!("Uruchomiono user program 'hello' (ID={})", id.0);
+            format!("Uruchomiono user program 'hello' (ID={})", id.0)
         }
         "counter" => {
             let id = task::spawn("user-counter", userprogs::run_user_counter);
-            println!("Uruchomiono user program 'counter' (ID={})", id.0);
+            format!("Uruchomiono user program 'counter' (ID={})", id.0)
         }
         _ => {
-            println!("Dostepne programy: hello, counter");
-            println!("Uzycie: exec <program>");
+            // Try to load ELF from RamFS
+            let fs = FS.lock();
+            let data_opt = fs.read(cwd, name).map(|d| Vec::from(d));
+            drop(fs);
+
+            let data_opt = data_opt.or_else(|| {
+                let root_files = crate::fs::fat::list_root_files();
+                if root_files.is_empty() || root_files[0].contains("Error") || root_files[0].contains("Not valid") {
+                    None
+                } else {
+                    crate::fs::fat::read_file(name)
+                }
+            });
+
+            if let Some(data) = data_opt {
+                match crate::kernel::elf::load_and_map_elf(&data) {
+                    Ok(entry_addr) => {
+                        let entry_fn: fn() = unsafe { core::mem::transmute(entry_addr) };
+                        let id = task::spawn("user-elf", entry_fn);
+                        format!("Uruchomiono ELF '{}' (ID={})", name, id.0)
+                    }
+                    Err(e) => format!("Blad ladowania ELF: {}", e),
+                }
+            } else {
+                format!("Nie znaleziono programu '{}'. Dostepne wbudowane: hello, counter", name)
+            }
         }
     }
+}
+
+// --- Environment variables ---
+
+use alloc::collections::BTreeMap;
+use spin::Mutex;
+
+lazy_static::lazy_static! {
+    pub static ref ENV_VARS: Mutex<BTreeMap<String, String>> = {
+        let mut map = BTreeMap::new();
+        map.insert(String::from("PATH"), String::from("/"));
+        map.insert(String::from("HOME"), String::from("/"));
+        map.insert(String::from("SHELL"), String::from("polarsh"));
+        map.insert(String::from("OS"), String::from("PolarOs"));
+        Mutex::new(map)
+    };
+}
+
+/// Expand $VAR and ${VAR} in a string
+pub fn expand_env_vars(input: &str) -> String {
+    let env = ENV_VARS.lock();
+    let mut result = String::new();
+    let mut chars = input.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            let mut var_name = String::new();
+            let braced = chars.peek() == Some(&'{');
+            if braced { chars.next(); }
+
+            while let Some(&c) = chars.peek() {
+                if braced {
+                    if c == '}' { chars.next(); break; }
+                    var_name.push(c);
+                    chars.next();
+                } else if c.is_alphanumeric() || c == '_' {
+                    var_name.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            if let Some(value) = env.get(&var_name) {
+                result.push_str(value);
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
+fn cmd_env() -> String {
+    let env = ENV_VARS.lock();
+    let mut s = String::new();
+    for (key, value) in env.iter() {
+        s.push_str(&format!("{}={}\n", key, value));
+    }
+    if s.ends_with('\n') { s.pop(); }
+    s
+}
+
+fn cmd_export(args: &str) -> String {
+    let args = args.trim();
+    if let Some((key, value)) = args.split_once('=') {
+        let key = key.trim();
+        let value = value.trim();
+        if key.is_empty() {
+            return String::from("Uzycie: export KLUCZ=WARTOSC");
+        }
+        let mut env = ENV_VARS.lock();
+        env.insert(String::from(key), String::from(value));
+        format!("{}={}", key, value)
+    } else {
+        // Show single variable
+        let env = ENV_VARS.lock();
+        match env.get(args) {
+            Some(val) => format!("{}={}", args, val),
+            None => format!("Zmienna '{}' nie istnieje.", args),
+        }
+    }
+}
+
+// --- Extra pipe-friendly commands ---
+
+fn cmd_head(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let mut n: usize = 10;
+    let mut file_arg: Option<&str> = None;
+
+    let mut i = 0;
+    while i < parts.len() {
+        if parts[i] == "-n" {
+            if let Some(num_str) = parts.get(i + 1) {
+                n = num_str.parse().unwrap_or(10);
+                i += 2;
+                continue;
+            }
+        }
+        file_arg = Some(parts[i]);
+        i += 1;
+    }
+
+    let text = if let Some(input) = pipe_input {
+        String::from(input)
+    } else if let Some(filename) = file_arg {
+        let fs = FS.lock();
+        match fs.read(cwd, filename) {
+            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
+            None => return format!("Plik '{}' nie istnieje.", filename),
+        }
+    } else {
+        return String::from("Uzycie: head [-n N] <plik>");
+    };
+
+    let mut result = String::new();
+    for line in text.lines().take(n) {
+        result.push_str(line);
+        result.push('\n');
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
+fn cmd_tail(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let mut n: usize = 10;
+    let mut file_arg: Option<&str> = None;
+
+    let mut i = 0;
+    while i < parts.len() {
+        if parts[i] == "-n" {
+            if let Some(num_str) = parts.get(i + 1) {
+                n = num_str.parse().unwrap_or(10);
+                i += 2;
+                continue;
+            }
+        }
+        file_arg = Some(parts[i]);
+        i += 1;
+    }
+
+    let text = if let Some(input) = pipe_input {
+        String::from(input)
+    } else if let Some(filename) = file_arg {
+        let fs = FS.lock();
+        match fs.read(cwd, filename) {
+            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
+            None => return format!("Plik '{}' nie istnieje.", filename),
+        }
+    } else {
+        return String::from("Uzycie: tail [-n N] <plik>");
+    };
+
+    let all_lines: Vec<&str> = text.lines().collect();
+    let start = if all_lines.len() > n { all_lines.len() - n } else { 0 };
+    let mut result = String::new();
+    for line in &all_lines[start..] {
+        result.push_str(line);
+        result.push('\n');
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
+fn cmd_sort(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
+    let text = if let Some(input) = pipe_input {
+        String::from(input)
+    } else {
+        let name = match args.split_whitespace().next() {
+            Some(n) => n,
+            None => return String::from("Uzycie: sort <plik>"),
+        };
+        let fs = FS.lock();
+        match fs.read(cwd, name) {
+            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
+            None => return format!("Plik '{}' nie istnieje.", name),
+        }
+    };
+
+    let mut lines: Vec<&str> = text.lines().collect();
+    lines.sort();
+    let mut result = String::new();
+    for line in lines {
+        result.push_str(line);
+        result.push('\n');
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
+}
+
+fn cmd_keymap(args: &str) -> String {
+    use crate::drivers::keyboard;
+
+    let name = args.trim();
+    if name.is_empty() {
+        let current = keyboard::current_layout();
+        let mut s = format!("Aktualny layout: {}\n", keyboard::layout_name(current));
+        s.push_str("Dostepne: us, uk, de, fr, dvorak, colemak");
+        return s;
+    }
+
+    match keyboard::layout_from_name(name) {
+        Some(layout) => {
+            keyboard::set_layout(layout);
+            format!("Layout zmieniony na: {}", keyboard::layout_name(layout))
+        }
+        None => {
+            format!("Nieznany layout '{}'. Dostepne: us, uk, de, fr, dvorak, colemak", name)
+        }
+    }
+}
+
+fn cmd_uniq(pipe_input: Option<&str>) -> String {
+    let text = match pipe_input {
+        Some(input) => input,
+        None => return String::from("uniq wymaga danych z pipe (np. sort plik | uniq)"),
+    };
+
+    let mut result = String::new();
+    let mut prev: Option<&str> = None;
+    for line in text.lines() {
+        if prev != Some(line) {
+            result.push_str(line);
+            result.push('\n');
+            prev = Some(line);
+        }
+    }
+    if result.ends_with('\n') { result.pop(); }
+    result
 }
 
 ```
 
 src/shell/completion.rs
-
 ```rust
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -4896,6 +5767,7 @@ pub const COMMANDS: &[&str] = &[
     "help", "echo", "clear", "ls", "cat", "touch", "write", "rm",
     "mkdir", "cd", "pwd", "uptime", "info", "grep", "wc", "cp",
     "mv", "hexdump", "save", "load", "ps", "spawn", "kill", "exec",
+    "fatls", "env", "export", "head", "tail", "sort", "uniq", "keymap",
 ];
 
 pub fn tab_complete(input: &str, cwd: &[String]) -> (usize, Vec<String>) {
@@ -4936,7 +5808,6 @@ pub fn common_prefix(strings: &[String]) -> String {
 ```
 
 src/shell/mod.rs
-
 ```rust
 pub mod commands;
 pub mod completion;
@@ -4946,6 +5817,7 @@ use alloc::vec::Vec;
 use crate::{print, println};
 use crate::drivers::keyboard;
 use crate::drivers::vga;
+use crate::fs::{FS, FileSystem};
 
 const MAX_LINE: usize = 256;
 const HISTORY_MAX: usize = 16;
@@ -5025,8 +5897,166 @@ pub fn run() {
             continue;
         }
         history.push(trimmed);
-        commands::execute(trimmed, &mut cwd);
+        execute_line(trimmed, &mut cwd);
     }
+}
+
+/// Execute a full command line with pipe, redirect, and env var support.
+pub fn execute_line(line: &str, cwd: &mut Vec<String>) {
+    // 1. Expand environment variables ($VAR, ${VAR})
+    let expanded = commands::expand_env_vars(line);
+    let line = expanded.trim();
+    if line.is_empty() {
+        return;
+    }
+
+    // 2. Parse I/O redirections from the line
+    //    Supported: > file, >> file, < file
+    let (pipeline_str, redirect) = parse_redirections(line);
+
+    // 3. Split on pipe '|' and chain commands
+    let mut pipe_data: Option<String> = None;
+
+    // If we have input redirection, read the file as initial pipe data
+    if let Some(ref input_file) = redirect.input_file {
+        let fs = FS.lock();
+        match fs.read(cwd, input_file) {
+            Some(data) => {
+                pipe_data = Some(String::from(core::str::from_utf8(data).unwrap_or("")));
+            }
+            None => {
+                vga::set_color(vga::Color::LightRed, vga::Color::Black);
+                println!("Plik wejsciowy '{}' nie istnieje.", input_file);
+                vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+                return;
+            }
+        }
+    }
+
+    for part in pipeline_str.split('|') {
+        let part = part.trim();
+        if part.is_empty() { continue; }
+
+        let (cmd, args) = match part.split_once(' ') {
+            Some((c, a)) => (c, a),
+            None => (part, ""),
+        };
+
+        let output = commands::run_command(cmd, args, cwd, pipe_data.as_deref());
+        pipe_data = Some(output);
+    }
+
+    // 4. Handle output
+    if let Some(output) = pipe_data {
+        match redirect.output_mode {
+            OutputMode::Print => {
+                if !output.is_empty() {
+                    println!("{}", output);
+                }
+            }
+            OutputMode::Write(ref filename) => {
+                let mut fs = FS.lock();
+                if fs.write(cwd, filename, output.as_bytes()) {
+                    println!("Zapisano do '{}'.", filename);
+                } else {
+                    vga::set_color(vga::Color::LightRed, vga::Color::Black);
+                    println!("Nie mozna zapisac do '{}'.", filename);
+                    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+                }
+            }
+            OutputMode::Append(ref filename) => {
+                let mut fs = FS.lock();
+                // Read existing content, append new output
+                let mut existing = match fs.read(cwd, filename) {
+                    Some(data) => Vec::from(data),
+                    None => Vec::new(),
+                };
+                if !existing.is_empty() && existing.last() != Some(&b'\n') {
+                    existing.push(b'\n');
+                }
+                existing.extend_from_slice(output.as_bytes());
+                if fs.write(cwd, filename, &existing) {
+                    println!("Dopisano do '{}'.", filename);
+                } else {
+                    vga::set_color(vga::Color::LightRed, vga::Color::Black);
+                    println!("Nie mozna dopisac do '{}'.", filename);
+                    vga::set_color(vga::Color::LightGreen, vga::Color::Black);
+                }
+            }
+        }
+    }
+}
+
+enum OutputMode {
+    Print,
+    Write(String),
+    Append(String),
+}
+
+struct Redirect {
+    input_file: Option<String>,
+    output_mode: OutputMode,
+}
+
+fn parse_redirections(line: &str) -> (&str, Redirect) {
+    let mut redirect = Redirect {
+        input_file: None,
+        output_mode: OutputMode::Print,
+    };
+
+    // Find the last occurrence of redirect operators (not inside pipes)
+    // We search from the end of the line for >, >>, <
+    // Simple approach: find the last pipe segment and check for redirects there
+
+    // Find output redirect: >> or >
+    if let Some(pos) = line.rfind(">>") {
+        let filename = line[pos + 2..].trim();
+        if !filename.is_empty() && !filename.contains('|') {
+            let before = &line[..pos];
+            redirect.output_mode = OutputMode::Append(String::from(filename));
+
+            // Check for input redirect in the remaining part
+            if let Some(ipos) = before.rfind('<') {
+                let input_name = before[ipos + 1..].trim();
+                if !input_name.is_empty() {
+                    redirect.input_file = Some(String::from(input_name));
+                    return (&before[..ipos], redirect);
+                }
+            }
+            return (before, redirect);
+        }
+    }
+
+    if let Some(pos) = line.rfind('>') {
+        // Make sure it's not >>
+        if pos == 0 || line.as_bytes()[pos - 1] != b'>' {
+            let filename = line[pos + 1..].trim();
+            if !filename.is_empty() && !filename.contains('|') {
+                let before = &line[..pos];
+                redirect.output_mode = OutputMode::Write(String::from(filename));
+
+                if let Some(ipos) = before.rfind('<') {
+                    let input_name = before[ipos + 1..].trim();
+                    if !input_name.is_empty() {
+                        redirect.input_file = Some(String::from(input_name));
+                        return (&before[..ipos], redirect);
+                    }
+                }
+                return (before, redirect);
+            }
+        }
+    }
+
+    // Check for input redirect only
+    if let Some(pos) = line.rfind('<') {
+        let input_name = line[pos + 1..].trim();
+        if !input_name.is_empty() && !input_name.contains('|') && !input_name.contains('>') {
+            redirect.input_file = Some(String::from(input_name));
+            return (&line[..pos], redirect);
+        }
+    }
+
+    (line, redirect)
 }
 
 fn print_banner() {
@@ -5125,3 +6155,4 @@ fn read_line(history: &mut CommandHistory, cwd: &[String]) -> String {
 }
 
 ```
+

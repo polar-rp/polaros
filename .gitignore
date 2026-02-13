@@ -1,1 +1,90 @@
-target/
+# ============================================
+# Rust & Cargo
+# ============================================
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# ============================================
+# OS Development Artifacts
+# ============================================
+*.bin
+*.iso
+*.img
+*.qcow2
+*.vmdk
+
+# Bootloader artifacts
+boot/
+*.efi
+
+# ============================================
+# Debug & Logs
+# ============================================
+*.log
+*.out
+debug/
+*.dump
+core
+
+# ============================================
+# IDE & Editors
+# ============================================
+# VSCode
+.vscode/
+*.code-workspace
+
+# IntelliJ IDEA / CLion
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Vim
+*.swp
+*.swo
+*~
+.*.swp
+
+# Emacs
+\#*\#
+.#*
+
+# Visual Studio
+.vs/
+
+# ============================================
+# OS Specific
+# ============================================
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Linux
+.directory
+.Trash-*
+
+# ============================================
+# Build & Temporary Files
+# ============================================
+*.tmp
+*.temp
+*.bak
+*.cache
+.cache/
+
+# ============================================
+# Documentation (optional - uncomment if needed)
+# ============================================
+# *.md
+# !README.md
