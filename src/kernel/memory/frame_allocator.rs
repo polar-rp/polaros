@@ -4,6 +4,8 @@ use x86_64::{
     PhysAddr,
 };
 
+const PAGE_SIZE: u64 = 4096;
+
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
     next_addr: u64,
@@ -32,7 +34,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
                 region_start
             };
             if addr < region_end {
-                self.next_addr = addr + 4096;
+                self.next_addr = addr + PAGE_SIZE;
                 return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
             }
         }

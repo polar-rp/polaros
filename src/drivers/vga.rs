@@ -42,6 +42,7 @@ struct ScreenChar {
     color_code: ColorCode,
 }
 
+const VGA_BUFFER_ADDR: usize = 0xb8000;
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
 const TEXT_HEIGHT: usize = BUFFER_HEIGHT - 1; // row 24 reserved for status bar
@@ -145,7 +146,7 @@ lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::LightGreen, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        buffer: unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) },
     });
 }
 
@@ -192,7 +193,7 @@ pub fn set_color(foreground: Color, background: Color) {
 }
 
 pub fn update_status_bar(left: &str, right: &str) {
-    let vga = 0xb8000 as *mut ScreenChar;
+    let vga = VGA_BUFFER_ADDR as *mut ScreenChar;
     let row_offset = (BUFFER_HEIGHT - 1) * BUFFER_WIDTH;
     let color = ColorCode::new(Color::White, Color::DarkGray);
     let blank = ScreenChar { ascii_character: b' ', color_code: color };

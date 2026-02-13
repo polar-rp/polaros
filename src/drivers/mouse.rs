@@ -3,6 +3,17 @@ use x86_64::instructions::port::Port;
 use crate::gui::event::{Event, MouseButton, EVENT_QUEUE};
 use crate::gui::framebuffer::{SCREEN_WIDTH, SCREEN_HEIGHT};
 
+const PS2_STATUS_PORT: u16 = 0x64;
+const PS2_DATA_PORT: u16 = 0x60;
+const PS2_CMD_ENABLE_AUX: u8 = 0xA8;
+const PS2_CMD_READ_CONFIG: u8 = 0x20;
+const PS2_CMD_WRITE_CONFIG: u8 = 0x60;
+const PS2_CMD_WRITE_MOUSE: u8 = 0xD4;
+const MOUSE_CMD_DEFAULTS: u8 = 0xF6;
+const MOUSE_CMD_ENABLE: u8 = 0xF4;
+const STATUS_INPUT_FULL: u8 = 0x02;
+const STATUS_OUTPUT_FULL: u8 = 0x01;
+
 static MOUSE_STATE: Mutex<MouseState> = Mutex::new(MouseState::new());
 
 struct MouseState {
@@ -27,9 +38,9 @@ impl MouseState {
 
 fn wait_input() {
     for _ in 0..100_000 {
-        let mut status_port = Port::<u8>::new(0x64);
+        let mut status_port = Port::<u8>::new(PS2_STATUS_PORT);
         let status: u8 = unsafe { status_port.read() };
-        if status & 0x02 == 0 {
+        if status & STATUS_INPUT_FULL == 0 {
             return;
         }
     }
@@ -37,9 +48,9 @@ fn wait_input() {
 
 fn wait_output() {
     for _ in 0..100_000 {
-        let mut status_port = Port::<u8>::new(0x64);
+        let mut status_port = Port::<u8>::new(PS2_STATUS_PORT);
         let status: u8 = unsafe { status_port.read() };
-        if status & 0x01 != 0 {
+        if status & STATUS_OUTPUT_FULL != 0 {
             return;
         }
     }
@@ -48,17 +59,17 @@ fn wait_output() {
 fn command(cmd: u8) {
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0xD4);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_WRITE_MOUSE);
     }
     wait_input();
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         data_port.write(cmd);
     }
     wait_output();
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         let _ack = data_port.read();
     }
 }
@@ -67,37 +78,50 @@ pub fn init() {
     // Enable auxiliary device (mouse)
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0xA8);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_ENABLE_AUX);
     }
 
     // Enable IRQ12 - read config byte
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0x20);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_READ_CONFIG);
     }
     wait_output();
     let mut config: u8;
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         config = data_port.read();
     }
     config |= 0x02;
     config &= !0x20;
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0x60);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_WRITE_CONFIG);
     }
     wait_input();
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         data_port.write(config);
     }
 
-    command(0xF6);
-    command(0xF4);
+    command(MOUSE_CMD_DEFAULTS);
+    command(MOUSE_CMD_ENABLE);
+}
+
+fn emit_button_event(buttons: u8, prev: u8, mask: u8, button: MouseButton, x: i16, y: i16) {
+    if buttons & mask != 0 && prev & mask == 0 {
+        if let Some(mut queue) = EVENT_QUEUE.try_lock() {
+            queue.push(Event::MouseDown { x, y, button });
+        }
+    }
+    if buttons & mask == 0 && prev & mask != 0 {
+        if let Some(mut queue) = EVENT_QUEUE.try_lock() {
+            queue.push(Event::MouseUp { x, y, button });
+        }
+    }
 }
 
 pub fn handle_byte(byte: u8) {
@@ -150,29 +174,8 @@ pub fn handle_byte(byte: u8) {
             let prev = state.prev_buttons;
             state.prev_buttons = buttons;
 
-            // Left button
-            if buttons & 0x01 != 0 && prev & 0x01 == 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseDown { x: new_x, y: new_y, button: MouseButton::Left });
-                }
-            }
-            if buttons & 0x01 == 0 && prev & 0x01 != 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseUp { x: new_x, y: new_y, button: MouseButton::Left });
-                }
-            }
-
-            // Right button
-            if buttons & 0x02 != 0 && prev & 0x02 == 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseDown { x: new_x, y: new_y, button: MouseButton::Right });
-                }
-            }
-            if buttons & 0x02 == 0 && prev & 0x02 != 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseUp { x: new_x, y: new_y, button: MouseButton::Right });
-                }
-            }
+            emit_button_event(buttons, prev, 0x01, MouseButton::Left, new_x, new_y);
+            emit_button_event(buttons, prev, 0x02, MouseButton::Right, new_x, new_y);
         }
         _ => {
             state.cycle = 0;

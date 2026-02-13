@@ -88,56 +88,78 @@ impl DirEntry {
     }
 }
 
-// Global cached FS info could be stored here, but for simplicity we read BPB every time or assume LBA 0 (Partition 0) or LBA 2048 (if MBR present).
-// Let's assume MBR and Partition 1 is FAT32. Or just try LBA 0.
-const PARTITION_OFFSET: u32 = 0; // Try 0 (superfloppy) or 2048?
-// Standard MBR often puts first partition at 2048.
-// We will try to read LBA 0, check signature. If MBR, read partition table.
+const PARTITION_OFFSET: u32 = 0;
+const ENTRIES_PER_SECTOR: usize = 16; // 512 / 32
 
-pub fn list_root_files() -> Vec<String> {
-    let mut files = Vec::new();
-    
-    // Read Boot Sector
+struct FatLayout {
+    data_start: u32,
+    root_cluster: u32,
+    sectors_per_cluster: u8,
+}
+
+/// Read and validate the FAT32 BPB, returning computed layout info.
+fn read_fat_layout() -> Result<FatLayout, &'static str> {
     let mut sector = [0u8; 512];
     if !ata::read_sector(PARTITION_OFFSET, &mut sector) {
-        files.push("ATA Read Error".into());
-        return files;
+        return Err("ATA Read Error");
     }
-
-    // Basic check for BPB
-    // We cast to BPB. 
-    // Note: This is unsafe casting of packed struct.
     let bpb = unsafe { &*(sector.as_ptr() as *const BPB) };
-
     if bpb.bytes_per_sector != 512 {
-        // Might be MBR?
-        files.push("Not valid FAT32 (invalid sector size)".into());
-        return files;
+        return Err("Not valid FAT32 (invalid sector size)");
     }
-    
-    // Calculate offsets
     let fat_start = PARTITION_OFFSET + bpb.reserved_sectors as u32;
     let fat_size = bpb.sectors_per_fat_32;
     let data_start = fat_start + (bpb.fats as u32 * fat_size);
-    let root_cluster = bpb.root_cluster;
-    
-    // Read Root Directory (which is a cluster chain)
-    // For MVP, read just the first cluster of Root Dir.
-    let root_lba = cluster_to_lba(root_cluster, data_start, bpb.sectors_per_cluster);
-    
-    if !ata::read_sector(root_lba, &mut sector) {
-        files.push("Failed to read Root Dir".into());
-        return files;
-    }
+    Ok(FatLayout {
+        data_start,
+        root_cluster: bpb.root_cluster,
+        sectors_per_cluster: bpb.sectors_per_cluster,
+    })
+}
 
-    // Parse entries
-    for i in 0..16 { // 512 / 32 = 16 entries per sector
+fn cluster_to_lba(cluster: u32, data_start: u32, sectors_per_cluster: u8) -> u32 {
+    data_start + ((cluster - 2) * sectors_per_cluster as u32)
+}
+
+/// Iterate directory entries in the first sector of a cluster, calling `f` for each valid entry.
+/// Returns `Some(result)` if `f` returns `Some`, otherwise `None`.
+fn find_in_root_dir<T>(layout: &FatLayout, f: impl Fn(&DirEntry) -> Option<T>) -> Option<T> {
+    let root_lba = cluster_to_lba(layout.root_cluster, layout.data_start, layout.sectors_per_cluster);
+    let mut sector = [0u8; 512];
+    if !ata::read_sector(root_lba, &mut sector) {
+        return None;
+    }
+    for i in 0..ENTRIES_PER_SECTOR {
         let ptr = unsafe { sector.as_ptr().add(i * 32) };
         let entry = unsafe { &*(ptr as *const DirEntry) };
-
         if entry.is_end() { break; }
         if entry.is_free() || entry.is_long_name() { continue; }
-        
+        if let Some(result) = f(entry) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+pub fn list_root_files() -> Vec<String> {
+    let layout = match read_fat_layout() {
+        Ok(l) => l,
+        Err(e) => return alloc::vec![String::from(e)],
+    };
+
+    let root_lba = cluster_to_lba(layout.root_cluster, layout.data_start, layout.sectors_per_cluster);
+    let mut sector = [0u8; 512];
+    if !ata::read_sector(root_lba, &mut sector) {
+        return alloc::vec![String::from("Failed to read Root Dir")];
+    }
+
+    let mut files = Vec::new();
+    for i in 0..ENTRIES_PER_SECTOR {
+        let ptr = unsafe { sector.as_ptr().add(i * 32) };
+        let entry = unsafe { &*(ptr as *const DirEntry) };
+        if entry.is_end() { break; }
+        if entry.is_free() || entry.is_long_name() { continue; }
+
         let mut name = entry.filename();
         if entry.is_dir() {
             name.push('/');
@@ -147,57 +169,23 @@ pub fn list_root_files() -> Vec<String> {
         }
         files.push(name);
     }
-
     files
 }
 
-fn cluster_to_lba(cluster: u32, data_start: u32, sectors_per_cluster: u8) -> u32 {
-    data_start + ((cluster - 2) * sectors_per_cluster as u32)
-}
-
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
-    // Re-read BPB logic (should be cached)
-    let mut sector = [0u8; 512];
-    ata::read_sector(PARTITION_OFFSET, &mut sector);
-    let bpb = unsafe { &*(sector.as_ptr() as *const BPB) };
-    
-    let fat_start = PARTITION_OFFSET + bpb.reserved_sectors as u32;
-    let fat_size = bpb.sectors_per_fat_32;
-    let data_start = fat_start + (bpb.fats as u32 * fat_size);
-    
-    // Find file in root dir
-    let root_lba = cluster_to_lba(bpb.root_cluster, data_start, bpb.sectors_per_cluster);
-    ata::read_sector(root_lba, &mut sector);
+    let layout = read_fat_layout().ok()?;
 
-    let mut found_entry: Option<DirEntry> = None;
-    
-    for i in 0..16 {
-        let ptr = unsafe { sector.as_ptr().add(i * 32) };
-        let entry = unsafe { &*(ptr as *const DirEntry) };
-        if entry.is_end() { break; }
-        if entry.is_free() || entry.is_long_name() { continue; }
-        
-        if entry.filename() == name {
-            found_entry = Some(*entry);
-            break;
-        }
-    }
+    let found_entry = find_in_root_dir(&layout, |entry| {
+        if entry.filename() == name { Some(*entry) } else { None }
+    })?;
 
-    if let Some(entry) = found_entry {
-        // Read file content (single cluster for now)
-        let start_cluster = entry.cluster();
-        let lba = cluster_to_lba(start_cluster, data_start, bpb.sectors_per_cluster);
-        
-        let mut data = Vec::with_capacity(entry.size as usize);
-        let mut buf = [0u8; 512];
-        
-        // Read just one sector/cluster for demo
-        // Todo: Follow FAT chain
-        ata::read_sector(lba, &mut buf);
-        data.extend_from_slice(&buf[..entry.size.min(512) as usize]);
-        
-        return Some(data);
-    }
+    let start_cluster = found_entry.cluster();
+    let lba = cluster_to_lba(start_cluster, layout.data_start, layout.sectors_per_cluster);
 
-    None
+    let mut data = Vec::with_capacity(found_entry.size as usize);
+    let mut buf = [0u8; 512];
+    ata::read_sector(lba, &mut buf);
+    data.extend_from_slice(&buf[..found_entry.size.min(512) as usize]);
+
+    Some(data)
 }

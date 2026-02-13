@@ -21,6 +21,9 @@ const CMD_WRITE: u8 = 0x30;
 const CMD_FLUSH: u8 = 0xE7;
 const CMD_IDENTIFY: u8 = 0xEC;
 
+const DRIVE_HEAD_MASTER_LBA: u8 = 0xE0;
+const WORDS_PER_SECTOR: usize = 256;
+
 pub const DATA_START_SECTOR: u32 = 2048;
 
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -45,7 +48,7 @@ fn wait_drq() -> bool {
 
 pub fn init() {
     unsafe {
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0);
+        Port::<u8>::new(DRIVE_HEAD).write(DRIVE_HEAD_MASTER_LBA);
         Port::<u8>::new(SECTOR_COUNT).write(0);
         Port::<u8>::new(LBA_LOW).write(0);
         Port::<u8>::new(LBA_MID).write(0);
@@ -68,7 +71,7 @@ pub fn init() {
         }
 
         let mut data_port = Port::<u16>::new(DATA);
-        for _ in 0..256 {
+        for _ in 0..WORDS_PER_SECTOR {
             data_port.read();
         }
 
@@ -84,7 +87,7 @@ pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
     if !is_available() { return false; }
     unsafe {
         wait_bsy();
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+        Port::<u8>::new(DRIVE_HEAD).write(DRIVE_HEAD_MASTER_LBA | ((lba >> 24) & 0x0F) as u8);
         Port::<u8>::new(SECTOR_COUNT).write(1);
         Port::<u8>::new(LBA_LOW).write(lba as u8);
         Port::<u8>::new(LBA_MID).write((lba >> 8) as u8);
@@ -94,7 +97,7 @@ pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
         if !wait_drq() { return false; }
 
         let mut data_port = Port::<u16>::new(DATA);
-        for i in 0..256 {
+        for i in 0..WORDS_PER_SECTOR {
             let word = data_port.read();
             buf[i * 2] = word as u8;
             buf[i * 2 + 1] = (word >> 8) as u8;
@@ -107,7 +110,7 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> bool {
     if !is_available() { return false; }
     unsafe {
         wait_bsy();
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+        Port::<u8>::new(DRIVE_HEAD).write(DRIVE_HEAD_MASTER_LBA | ((lba >> 24) & 0x0F) as u8);
         Port::<u8>::new(SECTOR_COUNT).write(1);
         Port::<u8>::new(LBA_LOW).write(lba as u8);
         Port::<u8>::new(LBA_MID).write((lba >> 8) as u8);
@@ -117,7 +120,7 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> bool {
         if !wait_drq() { return false; }
 
         let mut data_port = Port::<u16>::new(DATA);
-        for i in 0..256 {
+        for i in 0..WORDS_PER_SECTOR {
             let word = (buf[i * 2 + 1] as u16) << 8 | buf[i * 2] as u16;
             data_port.write(word);
         }
@@ -374,6 +377,17 @@ use x86_64::instructions::port::Port;
 use crate::gui::event::{Event, MouseButton, EVENT_QUEUE};
 use crate::gui::framebuffer::{SCREEN_WIDTH, SCREEN_HEIGHT};
 
+const PS2_STATUS_PORT: u16 = 0x64;
+const PS2_DATA_PORT: u16 = 0x60;
+const PS2_CMD_ENABLE_AUX: u8 = 0xA8;
+const PS2_CMD_READ_CONFIG: u8 = 0x20;
+const PS2_CMD_WRITE_CONFIG: u8 = 0x60;
+const PS2_CMD_WRITE_MOUSE: u8 = 0xD4;
+const MOUSE_CMD_DEFAULTS: u8 = 0xF6;
+const MOUSE_CMD_ENABLE: u8 = 0xF4;
+const STATUS_INPUT_FULL: u8 = 0x02;
+const STATUS_OUTPUT_FULL: u8 = 0x01;
+
 static MOUSE_STATE: Mutex<MouseState> = Mutex::new(MouseState::new());
 
 struct MouseState {
@@ -398,9 +412,9 @@ impl MouseState {
 
 fn wait_input() {
     for _ in 0..100_000 {
-        let mut status_port = Port::<u8>::new(0x64);
+        let mut status_port = Port::<u8>::new(PS2_STATUS_PORT);
         let status: u8 = unsafe { status_port.read() };
-        if status & 0x02 == 0 {
+        if status & STATUS_INPUT_FULL == 0 {
             return;
         }
     }
@@ -408,9 +422,9 @@ fn wait_input() {
 
 fn wait_output() {
     for _ in 0..100_000 {
-        let mut status_port = Port::<u8>::new(0x64);
+        let mut status_port = Port::<u8>::new(PS2_STATUS_PORT);
         let status: u8 = unsafe { status_port.read() };
-        if status & 0x01 != 0 {
+        if status & STATUS_OUTPUT_FULL != 0 {
             return;
         }
     }
@@ -419,17 +433,17 @@ fn wait_output() {
 fn command(cmd: u8) {
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0xD4);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_WRITE_MOUSE);
     }
     wait_input();
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         data_port.write(cmd);
     }
     wait_output();
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         let _ack = data_port.read();
     }
 }
@@ -438,37 +452,50 @@ pub fn init() {
     // Enable auxiliary device (mouse)
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0xA8);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_ENABLE_AUX);
     }
 
     // Enable IRQ12 - read config byte
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0x20);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_READ_CONFIG);
     }
     wait_output();
     let mut config: u8;
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         config = data_port.read();
     }
     config |= 0x02;
     config &= !0x20;
     wait_input();
     unsafe {
-        let mut command_port = Port::<u8>::new(0x64);
-        command_port.write(0x60);
+        let mut command_port = Port::<u8>::new(PS2_STATUS_PORT);
+        command_port.write(PS2_CMD_WRITE_CONFIG);
     }
     wait_input();
     unsafe {
-        let mut data_port = Port::<u8>::new(0x60);
+        let mut data_port = Port::<u8>::new(PS2_DATA_PORT);
         data_port.write(config);
     }
 
-    command(0xF6);
-    command(0xF4);
+    command(MOUSE_CMD_DEFAULTS);
+    command(MOUSE_CMD_ENABLE);
+}
+
+fn emit_button_event(buttons: u8, prev: u8, mask: u8, button: MouseButton, x: i16, y: i16) {
+    if buttons & mask != 0 && prev & mask == 0 {
+        if let Some(mut queue) = EVENT_QUEUE.try_lock() {
+            queue.push(Event::MouseDown { x, y, button });
+        }
+    }
+    if buttons & mask == 0 && prev & mask != 0 {
+        if let Some(mut queue) = EVENT_QUEUE.try_lock() {
+            queue.push(Event::MouseUp { x, y, button });
+        }
+    }
 }
 
 pub fn handle_byte(byte: u8) {
@@ -521,29 +548,8 @@ pub fn handle_byte(byte: u8) {
             let prev = state.prev_buttons;
             state.prev_buttons = buttons;
 
-            // Left button
-            if buttons & 0x01 != 0 && prev & 0x01 == 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseDown { x: new_x, y: new_y, button: MouseButton::Left });
-                }
-            }
-            if buttons & 0x01 == 0 && prev & 0x01 != 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseUp { x: new_x, y: new_y, button: MouseButton::Left });
-                }
-            }
-
-            // Right button
-            if buttons & 0x02 != 0 && prev & 0x02 == 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseDown { x: new_x, y: new_y, button: MouseButton::Right });
-                }
-            }
-            if buttons & 0x02 == 0 && prev & 0x02 != 0 {
-                if let Some(mut queue) = EVENT_QUEUE.try_lock() {
-                    queue.push(Event::MouseUp { x: new_x, y: new_y, button: MouseButton::Right });
-                }
-            }
+            emit_button_event(buttons, prev, 0x01, MouseButton::Left, new_x, new_y);
+            emit_button_event(buttons, prev, 0x02, MouseButton::Right, new_x, new_y);
         }
         _ => {
             state.cycle = 0;
@@ -644,6 +650,7 @@ struct ScreenChar {
     color_code: ColorCode,
 }
 
+const VGA_BUFFER_ADDR: usize = 0xb8000;
 const BUFFER_HEIGHT: usize = 25;
 const BUFFER_WIDTH: usize = 80;
 const TEXT_HEIGHT: usize = BUFFER_HEIGHT - 1; // row 24 reserved for status bar
@@ -747,7 +754,7 @@ lazy_static! {
     pub static ref WRITER: Mutex<Writer> = Mutex::new(Writer {
         column_position: 0,
         color_code: ColorCode::new(Color::LightGreen, Color::Black),
-        buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+        buffer: unsafe { &mut *(VGA_BUFFER_ADDR as *mut Buffer) },
     });
 }
 
@@ -794,7 +801,7 @@ pub fn set_color(foreground: Color, background: Color) {
 }
 
 pub fn update_status_bar(left: &str, right: &str) {
-    let vga = 0xb8000 as *mut ScreenChar;
+    let vga = VGA_BUFFER_ADDR as *mut ScreenChar;
     let row_offset = (BUFFER_HEIGHT - 1) * BUFFER_WIDTH;
     let color = ColorCode::new(Color::White, Color::DarkGray);
     let blank = ScreenChar { ascii_character: b' ', color_code: color };
@@ -916,56 +923,78 @@ impl DirEntry {
     }
 }
 
-// Global cached FS info could be stored here, but for simplicity we read BPB every time or assume LBA 0 (Partition 0) or LBA 2048 (if MBR present).
-// Let's assume MBR and Partition 1 is FAT32. Or just try LBA 0.
-const PARTITION_OFFSET: u32 = 0; // Try 0 (superfloppy) or 2048?
-// Standard MBR often puts first partition at 2048.
-// We will try to read LBA 0, check signature. If MBR, read partition table.
+const PARTITION_OFFSET: u32 = 0;
+const ENTRIES_PER_SECTOR: usize = 16; // 512 / 32
 
-pub fn list_root_files() -> Vec<String> {
-    let mut files = Vec::new();
-    
-    // Read Boot Sector
+struct FatLayout {
+    data_start: u32,
+    root_cluster: u32,
+    sectors_per_cluster: u8,
+}
+
+/// Read and validate the FAT32 BPB, returning computed layout info.
+fn read_fat_layout() -> Result<FatLayout, &'static str> {
     let mut sector = [0u8; 512];
     if !ata::read_sector(PARTITION_OFFSET, &mut sector) {
-        files.push("ATA Read Error".into());
-        return files;
+        return Err("ATA Read Error");
     }
-
-    // Basic check for BPB
-    // We cast to BPB. 
-    // Note: This is unsafe casting of packed struct.
     let bpb = unsafe { &*(sector.as_ptr() as *const BPB) };
-
     if bpb.bytes_per_sector != 512 {
-        // Might be MBR?
-        files.push("Not valid FAT32 (invalid sector size)".into());
-        return files;
+        return Err("Not valid FAT32 (invalid sector size)");
     }
-    
-    // Calculate offsets
     let fat_start = PARTITION_OFFSET + bpb.reserved_sectors as u32;
     let fat_size = bpb.sectors_per_fat_32;
     let data_start = fat_start + (bpb.fats as u32 * fat_size);
-    let root_cluster = bpb.root_cluster;
-    
-    // Read Root Directory (which is a cluster chain)
-    // For MVP, read just the first cluster of Root Dir.
-    let root_lba = cluster_to_lba(root_cluster, data_start, bpb.sectors_per_cluster);
-    
-    if !ata::read_sector(root_lba, &mut sector) {
-        files.push("Failed to read Root Dir".into());
-        return files;
-    }
+    Ok(FatLayout {
+        data_start,
+        root_cluster: bpb.root_cluster,
+        sectors_per_cluster: bpb.sectors_per_cluster,
+    })
+}
 
-    // Parse entries
-    for i in 0..16 { // 512 / 32 = 16 entries per sector
+fn cluster_to_lba(cluster: u32, data_start: u32, sectors_per_cluster: u8) -> u32 {
+    data_start + ((cluster - 2) * sectors_per_cluster as u32)
+}
+
+/// Iterate directory entries in the first sector of a cluster, calling `f` for each valid entry.
+/// Returns `Some(result)` if `f` returns `Some`, otherwise `None`.
+fn find_in_root_dir<T>(layout: &FatLayout, f: impl Fn(&DirEntry) -> Option<T>) -> Option<T> {
+    let root_lba = cluster_to_lba(layout.root_cluster, layout.data_start, layout.sectors_per_cluster);
+    let mut sector = [0u8; 512];
+    if !ata::read_sector(root_lba, &mut sector) {
+        return None;
+    }
+    for i in 0..ENTRIES_PER_SECTOR {
         let ptr = unsafe { sector.as_ptr().add(i * 32) };
         let entry = unsafe { &*(ptr as *const DirEntry) };
-
         if entry.is_end() { break; }
         if entry.is_free() || entry.is_long_name() { continue; }
-        
+        if let Some(result) = f(entry) {
+            return Some(result);
+        }
+    }
+    None
+}
+
+pub fn list_root_files() -> Vec<String> {
+    let layout = match read_fat_layout() {
+        Ok(l) => l,
+        Err(e) => return alloc::vec![String::from(e)],
+    };
+
+    let root_lba = cluster_to_lba(layout.root_cluster, layout.data_start, layout.sectors_per_cluster);
+    let mut sector = [0u8; 512];
+    if !ata::read_sector(root_lba, &mut sector) {
+        return alloc::vec![String::from("Failed to read Root Dir")];
+    }
+
+    let mut files = Vec::new();
+    for i in 0..ENTRIES_PER_SECTOR {
+        let ptr = unsafe { sector.as_ptr().add(i * 32) };
+        let entry = unsafe { &*(ptr as *const DirEntry) };
+        if entry.is_end() { break; }
+        if entry.is_free() || entry.is_long_name() { continue; }
+
         let mut name = entry.filename();
         if entry.is_dir() {
             name.push('/');
@@ -975,59 +1004,25 @@ pub fn list_root_files() -> Vec<String> {
         }
         files.push(name);
     }
-
     files
 }
 
-fn cluster_to_lba(cluster: u32, data_start: u32, sectors_per_cluster: u8) -> u32 {
-    data_start + ((cluster - 2) * sectors_per_cluster as u32)
-}
-
 pub fn read_file(name: &str) -> Option<Vec<u8>> {
-    // Re-read BPB logic (should be cached)
-    let mut sector = [0u8; 512];
-    ata::read_sector(PARTITION_OFFSET, &mut sector);
-    let bpb = unsafe { &*(sector.as_ptr() as *const BPB) };
-    
-    let fat_start = PARTITION_OFFSET + bpb.reserved_sectors as u32;
-    let fat_size = bpb.sectors_per_fat_32;
-    let data_start = fat_start + (bpb.fats as u32 * fat_size);
-    
-    // Find file in root dir
-    let root_lba = cluster_to_lba(bpb.root_cluster, data_start, bpb.sectors_per_cluster);
-    ata::read_sector(root_lba, &mut sector);
+    let layout = read_fat_layout().ok()?;
 
-    let mut found_entry: Option<DirEntry> = None;
-    
-    for i in 0..16 {
-        let ptr = unsafe { sector.as_ptr().add(i * 32) };
-        let entry = unsafe { &*(ptr as *const DirEntry) };
-        if entry.is_end() { break; }
-        if entry.is_free() || entry.is_long_name() { continue; }
-        
-        if entry.filename() == name {
-            found_entry = Some(*entry);
-            break;
-        }
-    }
+    let found_entry = find_in_root_dir(&layout, |entry| {
+        if entry.filename() == name { Some(*entry) } else { None }
+    })?;
 
-    if let Some(entry) = found_entry {
-        // Read file content (single cluster for now)
-        let start_cluster = entry.cluster();
-        let lba = cluster_to_lba(start_cluster, data_start, bpb.sectors_per_cluster);
-        
-        let mut data = Vec::with_capacity(entry.size as usize);
-        let mut buf = [0u8; 512];
-        
-        // Read just one sector/cluster for demo
-        // Todo: Follow FAT chain
-        ata::read_sector(lba, &mut buf);
-        data.extend_from_slice(&buf[..entry.size.min(512) as usize]);
-        
-        return Some(data);
-    }
+    let start_cluster = found_entry.cluster();
+    let lba = cluster_to_lba(start_cluster, layout.data_start, layout.sectors_per_cluster);
 
-    None
+    let mut data = Vec::with_capacity(found_entry.size as usize);
+    let mut buf = [0u8; 512];
+    ata::read_sector(lba, &mut buf);
+    data.extend_from_slice(&buf[..found_entry.size.min(512) as usize]);
+
+    Some(data)
 }
 ```
 
@@ -3623,6 +3618,8 @@ use x86_64::{
     PhysAddr,
 };
 
+const PAGE_SIZE: u64 = 4096;
+
 pub struct BootInfoFrameAllocator {
     memory_map: &'static MemoryMap,
     next_addr: u64,
@@ -3651,7 +3648,7 @@ unsafe impl FrameAllocator<Size4KiB> for BootInfoFrameAllocator {
                 region_start
             };
             if addr < region_end {
-                self.next_addr = addr + 4096;
+                self.next_addr = addr + PAGE_SIZE;
                 return Some(PhysFrame::containing_address(PhysAddr::new(addr)));
             }
         }
@@ -3822,10 +3819,17 @@ pub const SYS_READ: u64 = 5;
 pub const SYS_CLOSE: u64 = 6;
 pub const SYS_STAT: u64 = 7;
 
+// Error codes (u64::MAX for backward compat, distinct constants for clarity)
+const EBADF: u64 = u64::MAX;
+const ENOENT: u64 = u64::MAX;
+const EINVAL: u64 = u64::MAX;
+const EMFILE: u64 = u64::MAX;
+
 /// Per-task file descriptor table.
 /// fd 0 = stdin (not really usable yet), fd 1 = stdout, fd 2 = stderr.
 /// fd 3+ = opened files.
 const MAX_FDS: usize = 16;
+const RESERVED_FDS: usize = 3;
 
 struct OpenFile {
     path: Vec<String>,
@@ -3839,9 +3843,15 @@ static mut FD_TABLE: [Option<OpenFile>; MAX_FDS] = {
     [NONE; MAX_FDS]
 };
 
+/// Read a user-space string from a pointer and length.
+fn read_user_str(ptr: u64, len: u64) -> Option<&'static str> {
+    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    core::str::from_utf8(slice).ok()
+}
+
 fn alloc_fd() -> Option<usize> {
     unsafe {
-        for i in 3..MAX_FDS {
+        for i in RESERVED_FDS..MAX_FDS {
             if FD_TABLE[i].is_none() {
                 return Some(i);
             }
@@ -3863,10 +3873,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
         SYS_READ => sys_read(arg0, arg1, arg2),
         SYS_CLOSE => sys_close(arg0),
         SYS_STAT => sys_stat(arg0, arg1),
-        _ => {
-            // Unknown syscall
-            u64::MAX
-        }
+        _ => EINVAL
     }
 }
 
@@ -3874,7 +3881,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
 fn sys_exit(_code: u64) -> u64 {
     // Clean up all open FDs for this task
     unsafe {
-        for i in 3..MAX_FDS {
+        for i in RESERVED_FDS..MAX_FDS {
             FD_TABLE[i] = None;
         }
     }
@@ -3884,7 +3891,7 @@ fn sys_exit(_code: u64) -> u64 {
 /// sys_write(fd, buf_ptr, len) - write to screen (fd=1 or fd=2 -> VGA)
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     if fd != 1 && fd != 2 {
-        return u64::MAX; // only stdout/stderr supported for writing
+        return EBADF;
     }
 
     let len = len as usize;
@@ -3924,30 +3931,26 @@ fn sys_getpid() -> u64 {
 /// sys_open(path_ptr, path_len) -> fd or u64::MAX on error
 /// Opens a file for reading. Path is relative to root.
 fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
-    let len = path_len as usize;
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
-    let path_str = match core::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(_) => return u64::MAX,
+    let path_str = match read_user_str(path_ptr, path_len) {
+        Some(s) => s,
+        None => return EINVAL,
     };
 
-    // Parse path: "/docs/info.txt" -> path=["docs"], name="info.txt"
     let (dir_path, filename) = parse_file_path(path_str);
 
-    // Check if file exists
     {
         let fs = FS.lock();
         if !fs.exists(&dir_path, &filename) {
-            return u64::MAX;
+            return ENOENT;
         }
         if fs.is_dir(&dir_path, &filename) {
-            return u64::MAX; // can't open directories
+            return EINVAL;
         }
     }
 
     let fd = match alloc_fd() {
         Some(fd) => fd,
-        None => return u64::MAX,
+        None => return EMFILE,
     };
 
     unsafe {
@@ -3965,13 +3968,13 @@ fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
 fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let fd = fd as usize;
     if fd >= MAX_FDS {
-        return u64::MAX;
+        return EBADF;
     }
 
     let (read_bytes, new_offset) = unsafe {
         let file = match &FD_TABLE[fd] {
             Some(f) => f,
-            None => return u64::MAX,
+            None => return EBADF,
         };
 
         let fs = FS.lock();
@@ -3987,7 +3990,7 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                 dest.copy_from_slice(&remaining[..to_read]);
                 (to_read, file.offset + to_read)
             }
-            None => return u64::MAX,
+            None => return ENOENT,
         }
     };
 
@@ -4004,26 +4007,24 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
 /// sys_close(fd) -> 0 on success, u64::MAX on error
 fn sys_close(fd: u64) -> u64 {
     let fd = fd as usize;
-    if fd < 3 || fd >= MAX_FDS {
-        return u64::MAX;
+    if fd < RESERVED_FDS || fd >= MAX_FDS {
+        return EBADF;
     }
     unsafe {
         if FD_TABLE[fd].is_some() {
             FD_TABLE[fd] = None;
             0
         } else {
-            u64::MAX
+            EBADF
         }
     }
 }
 
 /// sys_stat(path_ptr, path_len) -> file size or u64::MAX on error
 fn sys_stat(path_ptr: u64, path_len: u64) -> u64 {
-    let len = path_len as usize;
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
-    let path_str = match core::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(_) => return u64::MAX,
+    let path_str = match read_user_str(path_ptr, path_len) {
+        Some(s) => s,
+        None => return EINVAL,
     };
 
     let (dir_path, filename) = parse_file_path(path_str);
@@ -4031,7 +4032,7 @@ fn sys_stat(path_ptr: u64, path_len: u64) -> u64 {
     let fs = FS.lock();
     match fs.read(&dir_path, &filename) {
         Some(data) => data.len() as u64,
-        None => u64::MAX,
+        None => ENOENT,
     }
 }
 
@@ -4639,15 +4640,21 @@ use crate::kernel::pic::{InterruptIndex, PICS};
 use crate::kernel::task::context::switch_context;
 
 pub const TIMER_HZ: u32 = 100;
+
+const PIT_BASE_FREQUENCY: u32 = 1_193_182;
+const PIT_CMD_PORT: u16 = 0x43;
+const PIT_DATA_PORT: u16 = 0x40;
+const PIT_CMD_SQUARE_WAVE: u8 = 0x36;
+
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_timer() {
     use x86_64::instructions::port::Port;
-    let divisor: u16 = (1_193_182u32 / TIMER_HZ) as u16;
+    let divisor: u16 = (PIT_BASE_FREQUENCY / TIMER_HZ) as u16;
     unsafe {
-        let mut cmd = Port::<u8>::new(0x43);
-        let mut data = Port::<u8>::new(0x40);
-        cmd.write(0x36);
+        let mut cmd = Port::<u8>::new(PIT_CMD_PORT);
+        let mut data = Port::<u8>::new(PIT_DATA_PORT);
+        cmd.write(PIT_CMD_SQUARE_WAVE);
         data.write((divisor & 0xFF) as u8);
         data.write((divisor >> 8) as u8);
     }
@@ -4893,44 +4900,146 @@ use alloc::vec::Vec;
 use alloc::format;
 use crate::fs::{FS, FileSystem, RemoveResult};
 
+pub struct CommandEntry {
+    pub name: &'static str,
+    help: &'static str,
+    handler: Option<fn(&str, &mut Vec<String>, Option<&str>) -> String>,
+}
+
+/// Single source of truth for all commands: name, help text, and handler.
+/// Commands with `handler: None` are handled specially in `run_command`.
+static COMMAND_TABLE: &[CommandEntry] = &[
+    CommandEntry { name: "help",    help: "Wyswietl te pomoc",            handler: Some(cmd_help_wrapper) },
+    CommandEntry { name: "echo",    help: "Wyswietl tekst",              handler: Some(cmd_echo_wrapper) },
+    CommandEntry { name: "clear",   help: "Wyczysc ekran",               handler: None },
+    CommandEntry { name: "ls",      help: "Lista plikow i katalogow",    handler: Some(cmd_ls_wrapper) },
+    CommandEntry { name: "cat",     help: "Wyswietl zawartosc pliku",    handler: Some(cmd_cat_wrapper) },
+    CommandEntry { name: "touch",   help: "Utworz pusty plik",           handler: Some(cmd_touch_wrapper) },
+    CommandEntry { name: "write",   help: "Zapisz tekst do pliku",       handler: Some(cmd_write_wrapper) },
+    CommandEntry { name: "rm",      help: "Usun plik lub pusty katalog", handler: Some(cmd_rm_wrapper) },
+    CommandEntry { name: "mkdir",   help: "Utworz katalog",              handler: Some(cmd_mkdir_wrapper) },
+    CommandEntry { name: "cd",      help: "Zmien katalog (cd .. / cd /)", handler: None },
+    CommandEntry { name: "pwd",     help: "Wyswietl biezacy katalog",    handler: Some(cmd_pwd_wrapper) },
+    CommandEntry { name: "grep",    help: "Szukaj wzorca w pliku",       handler: Some(cmd_grep_wrapper) },
+    CommandEntry { name: "wc",      help: "Policz linie/slowa/bajty",    handler: Some(cmd_wc_wrapper) },
+    CommandEntry { name: "cp",      help: "Kopiuj plik",                 handler: Some(cmd_cp_wrapper) },
+    CommandEntry { name: "mv",      help: "Przenies/zmien nazwe pliku",  handler: Some(cmd_mv_wrapper) },
+    CommandEntry { name: "hexdump", help: "Zrzut szesnastkowy pliku",    handler: Some(cmd_hexdump_wrapper) },
+    CommandEntry { name: "head",    help: "Pokaz pierwszych N linii",    handler: Some(cmd_head_wrapper) },
+    CommandEntry { name: "tail",    help: "Pokaz ostatnich N linii",     handler: Some(cmd_tail_wrapper) },
+    CommandEntry { name: "sort",    help: "Sortuj linie",                handler: Some(cmd_sort_wrapper) },
+    CommandEntry { name: "uniq",    help: "Usun powtorzenia (pipe)",     handler: Some(cmd_uniq_wrapper) },
+    CommandEntry { name: "save",    help: "Zapisz FS na dysk ATA",       handler: Some(cmd_save_wrapper) },
+    CommandEntry { name: "load",    help: "Wczytaj FS z dysku ATA",      handler: None },
+    CommandEntry { name: "uptime",  help: "Czas dzialania systemu",      handler: Some(cmd_uptime_wrapper) },
+    CommandEntry { name: "info",    help: "Informacje systemowe",        handler: Some(cmd_info_wrapper) },
+    CommandEntry { name: "ps",      help: "Lista procesow/taskow",       handler: Some(cmd_ps_wrapper) },
+    CommandEntry { name: "spawn",   help: "Uruchom demo task",           handler: Some(cmd_spawn_wrapper) },
+    CommandEntry { name: "kill",    help: "Zakoncz task o podanym ID",   handler: Some(cmd_kill_wrapper) },
+    CommandEntry { name: "exec",    help: "Uruchom program uzytkownika", handler: Some(cmd_exec_wrapper) },
+    CommandEntry { name: "env",     help: "Pokaz zmienne srodowiskowe",  handler: Some(cmd_env_wrapper) },
+    CommandEntry { name: "export",  help: "Ustaw zmienna srodowiskowa",  handler: Some(cmd_export_wrapper) },
+    CommandEntry { name: "fatls",   help: "Lista plikow FAT32",          handler: Some(cmd_fatls_wrapper) },
+    CommandEntry { name: "keymap",  help: "Pokaz/zmien layout klawiatury", handler: Some(cmd_keymap_wrapper) },
+];
+
+/// Get command names from the table (used by completion).
+pub fn command_names() -> &'static [CommandEntry] {
+    COMMAND_TABLE
+}
+
+// Wrapper functions that adapt existing handlers to the unified signature.
+fn cmd_help_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_help() }
+fn cmd_echo_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_echo(a) }
+fn cmd_ls_wrapper(_: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_ls(c) }
+fn cmd_cat_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_cat(a, c) }
+fn cmd_touch_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_touch(a, c) }
+fn cmd_write_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_write(a, c) }
+fn cmd_rm_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_rm(a, c) }
+fn cmd_mkdir_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_mkdir(a, c) }
+fn cmd_pwd_wrapper(_: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_pwd(c) }
+fn cmd_grep_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_grep(a, c, p) }
+fn cmd_wc_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_wc(a, c, p) }
+fn cmd_cp_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_cp(a, c) }
+fn cmd_mv_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_mv(a, c) }
+fn cmd_hexdump_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_hexdump(a, c) }
+fn cmd_head_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_head(a, c, p) }
+fn cmd_tail_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_tail(a, c, p) }
+fn cmd_sort_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_sort(a, c, p) }
+fn cmd_uniq_wrapper(_: &str, _: &mut Vec<String>, p: Option<&str>) -> String { cmd_uniq(p) }
+fn cmd_save_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_save() }
+fn cmd_uptime_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_uptime() }
+fn cmd_info_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_info() }
+fn cmd_ps_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_ps() }
+fn cmd_spawn_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_spawn(a) }
+fn cmd_kill_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_kill(a) }
+fn cmd_exec_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_exec(a, c) }
+fn cmd_env_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_env() }
+fn cmd_export_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_export(a) }
+fn cmd_fatls_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_fatls() }
+fn cmd_keymap_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_keymap(a) }
+
+/// Read text either from pipe input, or from a file in the filesystem.
+fn read_text_input(pipe_input: Option<&str>, filename: Option<&str>, cwd: &[String], usage: &str) -> Result<String, String> {
+    if let Some(input) = pipe_input {
+        Ok(String::from(input))
+    } else if let Some(name) = filename {
+        let fs = FS.lock();
+        match fs.read(cwd, name) {
+            Some(data) => Ok(String::from(core::str::from_utf8(data).unwrap_or(""))),
+            None => Err(format!("Plik '{}' nie istnieje.", name)),
+        }
+    } else {
+        Err(String::from(usage))
+    }
+}
+
+/// Remove trailing newline from result string.
+fn trim_trailing_newline(s: &mut String) {
+    if s.ends_with('\n') { s.pop(); }
+}
+
+/// Parse `-n N [filename]` arguments common to head/tail.
+fn parse_n_args(args: &str, default_n: usize) -> (usize, Option<&str>) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let mut n = default_n;
+    let mut file_arg: Option<&str> = None;
+    let mut i = 0;
+    while i < parts.len() {
+        if parts[i] == "-n" {
+            if let Some(num_str) = parts.get(i + 1) {
+                n = num_str.parse().unwrap_or(default_n);
+                i += 2;
+                continue;
+            }
+        }
+        file_arg = Some(parts[i]);
+        i += 1;
+    }
+    (n, file_arg)
+}
+
 /// Execute a single command and return its output as a String.
 /// `pipe_input` is the output of the previous command in a pipeline (if any).
 pub fn run_command(cmd: &str, args: &str, cwd: &mut Vec<String>, pipe_input: Option<&str>) -> String {
+    // Handle special commands that can't use the table (need &mut cwd or side effects)
     match cmd {
-        "help" => cmd_help(),
-        "echo" => cmd_echo(args),
-        "clear" => { crate::drivers::vga::clear_screen(); String::new() }
-        "ls" => cmd_ls(cwd),
-        "cat" => cmd_cat(args, cwd),
-        "touch" => cmd_touch(args, cwd),
-        "write" => cmd_write(args, cwd),
-        "rm" => cmd_rm(args, cwd),
-        "mkdir" => cmd_mkdir(args, cwd),
-        "cd" => { cmd_cd(args, cwd); String::new() }
-        "pwd" => cmd_pwd(cwd),
-        "uptime" => cmd_uptime(),
-        "info" => cmd_info(),
-        "grep" => cmd_grep(args, cwd, pipe_input),
-        "wc" => cmd_wc(args, cwd, pipe_input),
-        "cp" => cmd_cp(args, cwd),
-        "mv" => cmd_mv(args, cwd),
-        "hexdump" => cmd_hexdump(args, cwd),
-        "save" => cmd_save(),
-        "load" => cmd_load(cwd),
-        "ps" => cmd_ps(),
-        "spawn" => cmd_spawn(args),
-        "kill" => cmd_kill(args),
-        "exec" => cmd_exec(args, cwd),
-        "fatls" => cmd_fatls(),
-        "env" => cmd_env(),
-        "export" => cmd_export(args),
-        "head" => cmd_head(args, cwd, pipe_input),
-        "tail" => cmd_tail(args, cwd, pipe_input),
-        "sort" => cmd_sort(args, cwd, pipe_input),
-        "uniq" => cmd_uniq(pipe_input),
-        "keymap" => cmd_keymap(args),
-        _ => format!("Nieznana komenda: '{}'. Wpisz 'help' aby zobaczyc liste komend.", cmd),
+        "clear" => { crate::drivers::vga::clear_screen(); return String::new() }
+        "cd" => { cmd_cd(args, cwd); return String::new() }
+        "load" => { return cmd_load(cwd) }
+        _ => {}
     }
+
+    // Look up in command table
+    for entry in COMMAND_TABLE {
+        if entry.name == cmd {
+            if let Some(handler) = entry.handler {
+                return handler(args, cwd, pipe_input);
+            }
+        }
+    }
+
+    format!("Nieznana komenda: '{}'. Wpisz 'help' aby zobaczyc liste komend.", cmd)
 }
 
 fn cmd_fatls() -> String {
@@ -4942,45 +5051,15 @@ fn cmd_fatls() -> String {
     for f in files {
         s.push_str(&format!("  {}\n", f));
     }
-    if s.ends_with('\n') { s.pop(); }
+    trim_trailing_newline(&mut s);
     s
 }
 
 fn cmd_help() -> String {
-    let mut s = String::new();
-    s.push_str("Dostepne komendy:\n");
-    s.push_str("  help              - Wyswietl te pomoc\n");
-    s.push_str("  echo <tekst>      - Wyswietl tekst\n");
-    s.push_str("  clear             - Wyczysc ekran\n");
-    s.push_str("  ls                - Lista plikow i katalogow\n");
-    s.push_str("  cat <plik>        - Wyswietl zawartosc pliku\n");
-    s.push_str("  touch <plik>      - Utworz pusty plik\n");
-    s.push_str("  write <plik> <t>  - Zapisz tekst do pliku\n");
-    s.push_str("  rm <nazwa>        - Usun plik lub pusty katalog\n");
-    s.push_str("  mkdir <nazwa>     - Utworz katalog\n");
-    s.push_str("  cd <katalog>      - Zmien katalog (cd .. / cd /)\n");
-    s.push_str("  pwd               - Wyswietl biezacy katalog\n");
-    s.push_str("  grep <wz> <plik>  - Szukaj wzorca w pliku\n");
-    s.push_str("  wc [plik]         - Policz linie/slowa/bajty\n");
-    s.push_str("  cp <src> <dst>    - Kopiuj plik\n");
-    s.push_str("  mv <src> <dst>    - Przenies/zmien nazwe pliku\n");
-    s.push_str("  hexdump <plik>    - Zrzut szesnastkowy pliku\n");
-    s.push_str("  head [-n N] [plik]- Pokaz pierwszych N linii\n");
-    s.push_str("  tail [-n N] [plik]- Pokaz ostatnich N linii\n");
-    s.push_str("  sort [plik]       - Sortuj linie\n");
-    s.push_str("  uniq              - Usun powtorzenia (pipe)\n");
-    s.push_str("  save              - Zapisz FS na dysk ATA\n");
-    s.push_str("  load              - Wczytaj FS z dysku ATA\n");
-    s.push_str("  uptime            - Czas dzialania systemu\n");
-    s.push_str("  info              - Informacje systemowe\n");
-    s.push_str("  ps                - Lista procesow/taskow\n");
-    s.push_str("  spawn <nazwa>     - Uruchom demo task\n");
-    s.push_str("  kill <id>         - Zakoncz task o podanym ID\n");
-    s.push_str("  exec <program>    - Uruchom program uzytkownika\n");
-    s.push_str("  env               - Pokaz zmienne srodowiskowe\n");
-    s.push_str("  export K=V        - Ustaw zmienna srodowiskowa\n");
-    s.push_str("  fatls             - Lista plikow FAT32\n");
-    s.push_str("  keymap [layout]   - Pokaz/zmien layout klawiatury\n");
+    let mut s = String::from("Dostepne komendy:\n");
+    for entry in COMMAND_TABLE {
+        s.push_str(&format!("  {:16}- {}\n", entry.name, entry.help));
+    }
     s.push_str("Pipe: cmd1 | cmd2   Redirect: cmd > plik, >> plik, < plik");
     s
 }
@@ -5004,7 +5083,7 @@ fn cmd_ls(cwd: &[String]) -> String {
                     s.push_str(&format!("  {} ({} bajtow)\n", entry.name, entry.size));
                 }
             }
-            if s.ends_with('\n') { s.pop(); }
+            trim_trailing_newline(&mut s);
             s
         }
         None => String::from("Katalog nie istnieje."),
@@ -5155,18 +5234,9 @@ fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         None => return String::from("Uzycie: grep <wzorzec> [plik]"),
     };
 
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else {
-        let filename = match parts.get(1) {
-            Some(f) => *f,
-            None => return String::from("Uzycie: grep <wzorzec> <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(cwd, filename) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", filename),
-        }
+    let text = match read_text_input(pipe_input, parts.get(1).copied(), cwd, "Uzycie: grep <wzorzec> <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let mut result = String::new();
@@ -5176,7 +5246,7 @@ fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
             result.push('\n');
         }
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     if result.is_empty() {
         format!("Brak wynikow dla '{}'.", pattern)
     } else {
@@ -5185,18 +5255,9 @@ fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
 }
 
 fn cmd_wc(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else {
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: wc <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(cwd, name) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", name),
-        }
+    let text = match read_text_input(pipe_input, args.split_whitespace().next(), cwd, "Uzycie: wc <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let bytes = text.len();
@@ -5278,7 +5339,7 @@ fn cmd_hexdump(args: &str, cwd: &[String]) -> String {
                 }
                 s.push_str("|\n");
             }
-            if s.ends_with('\n') { s.pop(); }
+            trim_trailing_newline(&mut s);
             s
         }
         None => format!("Plik '{}' nie istnieje.", name),
@@ -5390,7 +5451,7 @@ fn cmd_ps() -> String {
             s.push_str(&format!("  {:3} {}  {}\n", task.id.0, state_str, task.name));
         }
     });
-    if s.ends_with('\n') { s.pop(); }
+    trim_trailing_newline(&mut s);
     s
 }
 
@@ -5581,7 +5642,7 @@ fn cmd_env() -> String {
     for (key, value) in env.iter() {
         s.push_str(&format!("{}={}\n", key, value));
     }
-    if s.ends_with('\n') { s.pop(); }
+    trim_trailing_newline(&mut s);
     s
 }
 
@@ -5609,33 +5670,10 @@ fn cmd_export(args: &str) -> String {
 // --- Extra pipe-friendly commands ---
 
 fn cmd_head(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    let mut n: usize = 10;
-    let mut file_arg: Option<&str> = None;
-
-    let mut i = 0;
-    while i < parts.len() {
-        if parts[i] == "-n" {
-            if let Some(num_str) = parts.get(i + 1) {
-                n = num_str.parse().unwrap_or(10);
-                i += 2;
-                continue;
-            }
-        }
-        file_arg = Some(parts[i]);
-        i += 1;
-    }
-
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else if let Some(filename) = file_arg {
-        let fs = FS.lock();
-        match fs.read(cwd, filename) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", filename),
-        }
-    } else {
-        return String::from("Uzycie: head [-n N] <plik>");
+    let (n, file_arg) = parse_n_args(args, 10);
+    let text = match read_text_input(pipe_input, file_arg, cwd, "Uzycie: head [-n N] <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let mut result = String::new();
@@ -5643,38 +5681,15 @@ fn cmd_head(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         result.push_str(line);
         result.push('\n');
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
 fn cmd_tail(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    let mut n: usize = 10;
-    let mut file_arg: Option<&str> = None;
-
-    let mut i = 0;
-    while i < parts.len() {
-        if parts[i] == "-n" {
-            if let Some(num_str) = parts.get(i + 1) {
-                n = num_str.parse().unwrap_or(10);
-                i += 2;
-                continue;
-            }
-        }
-        file_arg = Some(parts[i]);
-        i += 1;
-    }
-
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else if let Some(filename) = file_arg {
-        let fs = FS.lock();
-        match fs.read(cwd, filename) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", filename),
-        }
-    } else {
-        return String::from("Uzycie: tail [-n N] <plik>");
+    let (n, file_arg) = parse_n_args(args, 10);
+    let text = match read_text_input(pipe_input, file_arg, cwd, "Uzycie: tail [-n N] <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let all_lines: Vec<&str> = text.lines().collect();
@@ -5684,23 +5699,14 @@ fn cmd_tail(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         result.push_str(line);
         result.push('\n');
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
 fn cmd_sort(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else {
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: sort <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(cwd, name) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", name),
-        }
+    let text = match read_text_input(pipe_input, args.split_whitespace().next(), cwd, "Uzycie: sort <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let mut lines: Vec<&str> = text.lines().collect();
@@ -5710,7 +5716,7 @@ fn cmd_sort(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         result.push_str(line);
         result.push('\n');
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
@@ -5751,7 +5757,7 @@ fn cmd_uniq(pipe_input: Option<&str>) -> String {
             prev = Some(line);
         }
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
@@ -5762,13 +5768,7 @@ src/shell/completion.rs
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::fs::{FS, FileSystem};
-
-pub const COMMANDS: &[&str] = &[
-    "help", "echo", "clear", "ls", "cat", "touch", "write", "rm",
-    "mkdir", "cd", "pwd", "uptime", "info", "grep", "wc", "cp",
-    "mv", "hexdump", "save", "load", "ps", "spawn", "kill", "exec",
-    "fatls", "env", "export", "head", "tail", "sort", "uniq", "keymap",
-];
+use crate::shell::commands::command_names;
 
 pub fn tab_complete(input: &str, cwd: &[String]) -> (usize, Vec<String>) {
     if let Some(space_pos) = input.rfind(' ') {
@@ -5781,9 +5781,9 @@ pub fn tab_complete(input: &str, cwd: &[String]) -> (usize, Vec<String>) {
             .collect();
         (word_start, matches)
     } else {
-        let matches: Vec<String> = COMMANDS.iter()
-            .filter(|c| c.starts_with(input))
-            .map(|c| String::from(*c))
+        let matches: Vec<String> = command_names().iter()
+            .filter(|e| e.name.starts_with(input))
+            .map(|e| String::from(e.name))
             .collect();
         (0, matches)
     }

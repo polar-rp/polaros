@@ -4,15 +4,21 @@ use crate::kernel::pic::{InterruptIndex, PICS};
 use crate::kernel::task::context::switch_context;
 
 pub const TIMER_HZ: u32 = 100;
+
+const PIT_BASE_FREQUENCY: u32 = 1_193_182;
+const PIT_CMD_PORT: u16 = 0x43;
+const PIT_DATA_PORT: u16 = 0x40;
+const PIT_CMD_SQUARE_WAVE: u8 = 0x36;
+
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init_timer() {
     use x86_64::instructions::port::Port;
-    let divisor: u16 = (1_193_182u32 / TIMER_HZ) as u16;
+    let divisor: u16 = (PIT_BASE_FREQUENCY / TIMER_HZ) as u16;
     unsafe {
-        let mut cmd = Port::<u8>::new(0x43);
-        let mut data = Port::<u8>::new(0x40);
-        cmd.write(0x36);
+        let mut cmd = Port::<u8>::new(PIT_CMD_PORT);
+        let mut data = Port::<u8>::new(PIT_DATA_PORT);
+        cmd.write(PIT_CMD_SQUARE_WAVE);
         data.write((divisor & 0xFF) as u8);
         data.write((divisor >> 8) as u8);
     }

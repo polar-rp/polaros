@@ -19,6 +19,9 @@ const CMD_WRITE: u8 = 0x30;
 const CMD_FLUSH: u8 = 0xE7;
 const CMD_IDENTIFY: u8 = 0xEC;
 
+const DRIVE_HEAD_MASTER_LBA: u8 = 0xE0;
+const WORDS_PER_SECTOR: usize = 256;
+
 pub const DATA_START_SECTOR: u32 = 2048;
 
 static AVAILABLE: AtomicBool = AtomicBool::new(false);
@@ -43,7 +46,7 @@ fn wait_drq() -> bool {
 
 pub fn init() {
     unsafe {
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0);
+        Port::<u8>::new(DRIVE_HEAD).write(DRIVE_HEAD_MASTER_LBA);
         Port::<u8>::new(SECTOR_COUNT).write(0);
         Port::<u8>::new(LBA_LOW).write(0);
         Port::<u8>::new(LBA_MID).write(0);
@@ -66,7 +69,7 @@ pub fn init() {
         }
 
         let mut data_port = Port::<u16>::new(DATA);
-        for _ in 0..256 {
+        for _ in 0..WORDS_PER_SECTOR {
             data_port.read();
         }
 
@@ -82,7 +85,7 @@ pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
     if !is_available() { return false; }
     unsafe {
         wait_bsy();
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+        Port::<u8>::new(DRIVE_HEAD).write(DRIVE_HEAD_MASTER_LBA | ((lba >> 24) & 0x0F) as u8);
         Port::<u8>::new(SECTOR_COUNT).write(1);
         Port::<u8>::new(LBA_LOW).write(lba as u8);
         Port::<u8>::new(LBA_MID).write((lba >> 8) as u8);
@@ -92,7 +95,7 @@ pub fn read_sector(lba: u32, buf: &mut [u8; 512]) -> bool {
         if !wait_drq() { return false; }
 
         let mut data_port = Port::<u16>::new(DATA);
-        for i in 0..256 {
+        for i in 0..WORDS_PER_SECTOR {
             let word = data_port.read();
             buf[i * 2] = word as u8;
             buf[i * 2 + 1] = (word >> 8) as u8;
@@ -105,7 +108,7 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> bool {
     if !is_available() { return false; }
     unsafe {
         wait_bsy();
-        Port::<u8>::new(DRIVE_HEAD).write(0xE0 | ((lba >> 24) & 0x0F) as u8);
+        Port::<u8>::new(DRIVE_HEAD).write(DRIVE_HEAD_MASTER_LBA | ((lba >> 24) & 0x0F) as u8);
         Port::<u8>::new(SECTOR_COUNT).write(1);
         Port::<u8>::new(LBA_LOW).write(lba as u8);
         Port::<u8>::new(LBA_MID).write((lba >> 8) as u8);
@@ -115,7 +118,7 @@ pub fn write_sector(lba: u32, buf: &[u8; 512]) -> bool {
         if !wait_drq() { return false; }
 
         let mut data_port = Port::<u16>::new(DATA);
-        for i in 0..256 {
+        for i in 0..WORDS_PER_SECTOR {
             let word = (buf[i * 2 + 1] as u16) << 8 | buf[i * 2] as u16;
             data_port.write(word);
         }

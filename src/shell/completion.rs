@@ -1,13 +1,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::fs::{FS, FileSystem};
-
-pub const COMMANDS: &[&str] = &[
-    "help", "echo", "clear", "ls", "cat", "touch", "write", "rm",
-    "mkdir", "cd", "pwd", "uptime", "info", "grep", "wc", "cp",
-    "mv", "hexdump", "save", "load", "ps", "spawn", "kill", "exec",
-    "fatls", "env", "export", "head", "tail", "sort", "uniq", "keymap",
-];
+use crate::shell::commands::command_names;
 
 pub fn tab_complete(input: &str, cwd: &[String]) -> (usize, Vec<String>) {
     if let Some(space_pos) = input.rfind(' ') {
@@ -20,9 +14,9 @@ pub fn tab_complete(input: &str, cwd: &[String]) -> (usize, Vec<String>) {
             .collect();
         (word_start, matches)
     } else {
-        let matches: Vec<String> = COMMANDS.iter()
-            .filter(|c| c.starts_with(input))
-            .map(|c| String::from(*c))
+        let matches: Vec<String> = command_names().iter()
+            .filter(|e| e.name.starts_with(input))
+            .map(|e| String::from(e.name))
             .collect();
         (0, matches)
     }

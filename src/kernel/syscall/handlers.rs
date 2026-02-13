@@ -13,10 +13,17 @@ pub const SYS_READ: u64 = 5;
 pub const SYS_CLOSE: u64 = 6;
 pub const SYS_STAT: u64 = 7;
 
+// Error codes (u64::MAX for backward compat, distinct constants for clarity)
+const EBADF: u64 = u64::MAX;
+const ENOENT: u64 = u64::MAX;
+const EINVAL: u64 = u64::MAX;
+const EMFILE: u64 = u64::MAX;
+
 /// Per-task file descriptor table.
 /// fd 0 = stdin (not really usable yet), fd 1 = stdout, fd 2 = stderr.
 /// fd 3+ = opened files.
 const MAX_FDS: usize = 16;
+const RESERVED_FDS: usize = 3;
 
 struct OpenFile {
     path: Vec<String>,
@@ -30,9 +37,15 @@ static mut FD_TABLE: [Option<OpenFile>; MAX_FDS] = {
     [NONE; MAX_FDS]
 };
 
+/// Read a user-space string from a pointer and length.
+fn read_user_str(ptr: u64, len: u64) -> Option<&'static str> {
+    let slice = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    core::str::from_utf8(slice).ok()
+}
+
 fn alloc_fd() -> Option<usize> {
     unsafe {
-        for i in 3..MAX_FDS {
+        for i in RESERVED_FDS..MAX_FDS {
             if FD_TABLE[i].is_none() {
                 return Some(i);
             }
@@ -54,10 +67,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
         SYS_READ => sys_read(arg0, arg1, arg2),
         SYS_CLOSE => sys_close(arg0),
         SYS_STAT => sys_stat(arg0, arg1),
-        _ => {
-            // Unknown syscall
-            u64::MAX
-        }
+        _ => EINVAL
     }
 }
 
@@ -65,7 +75,7 @@ pub extern "C" fn syscall_dispatch(nr: u64, arg0: u64, arg1: u64, arg2: u64) -> 
 fn sys_exit(_code: u64) -> u64 {
     // Clean up all open FDs for this task
     unsafe {
-        for i in 3..MAX_FDS {
+        for i in RESERVED_FDS..MAX_FDS {
             FD_TABLE[i] = None;
         }
     }
@@ -75,7 +85,7 @@ fn sys_exit(_code: u64) -> u64 {
 /// sys_write(fd, buf_ptr, len) - write to screen (fd=1 or fd=2 -> VGA)
 fn sys_write(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     if fd != 1 && fd != 2 {
-        return u64::MAX; // only stdout/stderr supported for writing
+        return EBADF;
     }
 
     let len = len as usize;
@@ -115,30 +125,26 @@ fn sys_getpid() -> u64 {
 /// sys_open(path_ptr, path_len) -> fd or u64::MAX on error
 /// Opens a file for reading. Path is relative to root.
 fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
-    let len = path_len as usize;
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
-    let path_str = match core::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(_) => return u64::MAX,
+    let path_str = match read_user_str(path_ptr, path_len) {
+        Some(s) => s,
+        None => return EINVAL,
     };
 
-    // Parse path: "/docs/info.txt" -> path=["docs"], name="info.txt"
     let (dir_path, filename) = parse_file_path(path_str);
 
-    // Check if file exists
     {
         let fs = FS.lock();
         if !fs.exists(&dir_path, &filename) {
-            return u64::MAX;
+            return ENOENT;
         }
         if fs.is_dir(&dir_path, &filename) {
-            return u64::MAX; // can't open directories
+            return EINVAL;
         }
     }
 
     let fd = match alloc_fd() {
         Some(fd) => fd,
-        None => return u64::MAX,
+        None => return EMFILE,
     };
 
     unsafe {
@@ -156,13 +162,13 @@ fn sys_open(path_ptr: u64, path_len: u64) -> u64 {
 fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
     let fd = fd as usize;
     if fd >= MAX_FDS {
-        return u64::MAX;
+        return EBADF;
     }
 
     let (read_bytes, new_offset) = unsafe {
         let file = match &FD_TABLE[fd] {
             Some(f) => f,
-            None => return u64::MAX,
+            None => return EBADF,
         };
 
         let fs = FS.lock();
@@ -178,7 +184,7 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
                 dest.copy_from_slice(&remaining[..to_read]);
                 (to_read, file.offset + to_read)
             }
-            None => return u64::MAX,
+            None => return ENOENT,
         }
     };
 
@@ -195,26 +201,24 @@ fn sys_read(fd: u64, buf_ptr: u64, len: u64) -> u64 {
 /// sys_close(fd) -> 0 on success, u64::MAX on error
 fn sys_close(fd: u64) -> u64 {
     let fd = fd as usize;
-    if fd < 3 || fd >= MAX_FDS {
-        return u64::MAX;
+    if fd < RESERVED_FDS || fd >= MAX_FDS {
+        return EBADF;
     }
     unsafe {
         if FD_TABLE[fd].is_some() {
             FD_TABLE[fd] = None;
             0
         } else {
-            u64::MAX
+            EBADF
         }
     }
 }
 
 /// sys_stat(path_ptr, path_len) -> file size or u64::MAX on error
 fn sys_stat(path_ptr: u64, path_len: u64) -> u64 {
-    let len = path_len as usize;
-    let slice = unsafe { core::slice::from_raw_parts(path_ptr as *const u8, len) };
-    let path_str = match core::str::from_utf8(slice) {
-        Ok(s) => s,
-        Err(_) => return u64::MAX,
+    let path_str = match read_user_str(path_ptr, path_len) {
+        Some(s) => s,
+        None => return EINVAL,
     };
 
     let (dir_path, filename) = parse_file_path(path_str);
@@ -222,7 +226,7 @@ fn sys_stat(path_ptr: u64, path_len: u64) -> u64 {
     let fs = FS.lock();
     match fs.read(&dir_path, &filename) {
         Some(data) => data.len() as u64,
-        None => u64::MAX,
+        None => ENOENT,
     }
 }
 

@@ -3,44 +3,146 @@ use alloc::vec::Vec;
 use alloc::format;
 use crate::fs::{FS, FileSystem, RemoveResult};
 
+pub struct CommandEntry {
+    pub name: &'static str,
+    help: &'static str,
+    handler: Option<fn(&str, &mut Vec<String>, Option<&str>) -> String>,
+}
+
+/// Single source of truth for all commands: name, help text, and handler.
+/// Commands with `handler: None` are handled specially in `run_command`.
+static COMMAND_TABLE: &[CommandEntry] = &[
+    CommandEntry { name: "help",    help: "Wyswietl te pomoc",            handler: Some(cmd_help_wrapper) },
+    CommandEntry { name: "echo",    help: "Wyswietl tekst",              handler: Some(cmd_echo_wrapper) },
+    CommandEntry { name: "clear",   help: "Wyczysc ekran",               handler: None },
+    CommandEntry { name: "ls",      help: "Lista plikow i katalogow",    handler: Some(cmd_ls_wrapper) },
+    CommandEntry { name: "cat",     help: "Wyswietl zawartosc pliku",    handler: Some(cmd_cat_wrapper) },
+    CommandEntry { name: "touch",   help: "Utworz pusty plik",           handler: Some(cmd_touch_wrapper) },
+    CommandEntry { name: "write",   help: "Zapisz tekst do pliku",       handler: Some(cmd_write_wrapper) },
+    CommandEntry { name: "rm",      help: "Usun plik lub pusty katalog", handler: Some(cmd_rm_wrapper) },
+    CommandEntry { name: "mkdir",   help: "Utworz katalog",              handler: Some(cmd_mkdir_wrapper) },
+    CommandEntry { name: "cd",      help: "Zmien katalog (cd .. / cd /)", handler: None },
+    CommandEntry { name: "pwd",     help: "Wyswietl biezacy katalog",    handler: Some(cmd_pwd_wrapper) },
+    CommandEntry { name: "grep",    help: "Szukaj wzorca w pliku",       handler: Some(cmd_grep_wrapper) },
+    CommandEntry { name: "wc",      help: "Policz linie/slowa/bajty",    handler: Some(cmd_wc_wrapper) },
+    CommandEntry { name: "cp",      help: "Kopiuj plik",                 handler: Some(cmd_cp_wrapper) },
+    CommandEntry { name: "mv",      help: "Przenies/zmien nazwe pliku",  handler: Some(cmd_mv_wrapper) },
+    CommandEntry { name: "hexdump", help: "Zrzut szesnastkowy pliku",    handler: Some(cmd_hexdump_wrapper) },
+    CommandEntry { name: "head",    help: "Pokaz pierwszych N linii",    handler: Some(cmd_head_wrapper) },
+    CommandEntry { name: "tail",    help: "Pokaz ostatnich N linii",     handler: Some(cmd_tail_wrapper) },
+    CommandEntry { name: "sort",    help: "Sortuj linie",                handler: Some(cmd_sort_wrapper) },
+    CommandEntry { name: "uniq",    help: "Usun powtorzenia (pipe)",     handler: Some(cmd_uniq_wrapper) },
+    CommandEntry { name: "save",    help: "Zapisz FS na dysk ATA",       handler: Some(cmd_save_wrapper) },
+    CommandEntry { name: "load",    help: "Wczytaj FS z dysku ATA",      handler: None },
+    CommandEntry { name: "uptime",  help: "Czas dzialania systemu",      handler: Some(cmd_uptime_wrapper) },
+    CommandEntry { name: "info",    help: "Informacje systemowe",        handler: Some(cmd_info_wrapper) },
+    CommandEntry { name: "ps",      help: "Lista procesow/taskow",       handler: Some(cmd_ps_wrapper) },
+    CommandEntry { name: "spawn",   help: "Uruchom demo task",           handler: Some(cmd_spawn_wrapper) },
+    CommandEntry { name: "kill",    help: "Zakoncz task o podanym ID",   handler: Some(cmd_kill_wrapper) },
+    CommandEntry { name: "exec",    help: "Uruchom program uzytkownika", handler: Some(cmd_exec_wrapper) },
+    CommandEntry { name: "env",     help: "Pokaz zmienne srodowiskowe",  handler: Some(cmd_env_wrapper) },
+    CommandEntry { name: "export",  help: "Ustaw zmienna srodowiskowa",  handler: Some(cmd_export_wrapper) },
+    CommandEntry { name: "fatls",   help: "Lista plikow FAT32",          handler: Some(cmd_fatls_wrapper) },
+    CommandEntry { name: "keymap",  help: "Pokaz/zmien layout klawiatury", handler: Some(cmd_keymap_wrapper) },
+];
+
+/// Get command names from the table (used by completion).
+pub fn command_names() -> &'static [CommandEntry] {
+    COMMAND_TABLE
+}
+
+// Wrapper functions that adapt existing handlers to the unified signature.
+fn cmd_help_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_help() }
+fn cmd_echo_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_echo(a) }
+fn cmd_ls_wrapper(_: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_ls(c) }
+fn cmd_cat_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_cat(a, c) }
+fn cmd_touch_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_touch(a, c) }
+fn cmd_write_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_write(a, c) }
+fn cmd_rm_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_rm(a, c) }
+fn cmd_mkdir_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_mkdir(a, c) }
+fn cmd_pwd_wrapper(_: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_pwd(c) }
+fn cmd_grep_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_grep(a, c, p) }
+fn cmd_wc_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_wc(a, c, p) }
+fn cmd_cp_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_cp(a, c) }
+fn cmd_mv_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_mv(a, c) }
+fn cmd_hexdump_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_hexdump(a, c) }
+fn cmd_head_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_head(a, c, p) }
+fn cmd_tail_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_tail(a, c, p) }
+fn cmd_sort_wrapper(a: &str, c: &mut Vec<String>, p: Option<&str>) -> String { cmd_sort(a, c, p) }
+fn cmd_uniq_wrapper(_: &str, _: &mut Vec<String>, p: Option<&str>) -> String { cmd_uniq(p) }
+fn cmd_save_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_save() }
+fn cmd_uptime_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_uptime() }
+fn cmd_info_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_info() }
+fn cmd_ps_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_ps() }
+fn cmd_spawn_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_spawn(a) }
+fn cmd_kill_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_kill(a) }
+fn cmd_exec_wrapper(a: &str, c: &mut Vec<String>, _: Option<&str>) -> String { cmd_exec(a, c) }
+fn cmd_env_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_env() }
+fn cmd_export_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_export(a) }
+fn cmd_fatls_wrapper(_: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_fatls() }
+fn cmd_keymap_wrapper(a: &str, _: &mut Vec<String>, _: Option<&str>) -> String { cmd_keymap(a) }
+
+/// Read text either from pipe input, or from a file in the filesystem.
+fn read_text_input(pipe_input: Option<&str>, filename: Option<&str>, cwd: &[String], usage: &str) -> Result<String, String> {
+    if let Some(input) = pipe_input {
+        Ok(String::from(input))
+    } else if let Some(name) = filename {
+        let fs = FS.lock();
+        match fs.read(cwd, name) {
+            Some(data) => Ok(String::from(core::str::from_utf8(data).unwrap_or(""))),
+            None => Err(format!("Plik '{}' nie istnieje.", name)),
+        }
+    } else {
+        Err(String::from(usage))
+    }
+}
+
+/// Remove trailing newline from result string.
+fn trim_trailing_newline(s: &mut String) {
+    if s.ends_with('\n') { s.pop(); }
+}
+
+/// Parse `-n N [filename]` arguments common to head/tail.
+fn parse_n_args(args: &str, default_n: usize) -> (usize, Option<&str>) {
+    let parts: Vec<&str> = args.split_whitespace().collect();
+    let mut n = default_n;
+    let mut file_arg: Option<&str> = None;
+    let mut i = 0;
+    while i < parts.len() {
+        if parts[i] == "-n" {
+            if let Some(num_str) = parts.get(i + 1) {
+                n = num_str.parse().unwrap_or(default_n);
+                i += 2;
+                continue;
+            }
+        }
+        file_arg = Some(parts[i]);
+        i += 1;
+    }
+    (n, file_arg)
+}
+
 /// Execute a single command and return its output as a String.
 /// `pipe_input` is the output of the previous command in a pipeline (if any).
 pub fn run_command(cmd: &str, args: &str, cwd: &mut Vec<String>, pipe_input: Option<&str>) -> String {
+    // Handle special commands that can't use the table (need &mut cwd or side effects)
     match cmd {
-        "help" => cmd_help(),
-        "echo" => cmd_echo(args),
-        "clear" => { crate::drivers::vga::clear_screen(); String::new() }
-        "ls" => cmd_ls(cwd),
-        "cat" => cmd_cat(args, cwd),
-        "touch" => cmd_touch(args, cwd),
-        "write" => cmd_write(args, cwd),
-        "rm" => cmd_rm(args, cwd),
-        "mkdir" => cmd_mkdir(args, cwd),
-        "cd" => { cmd_cd(args, cwd); String::new() }
-        "pwd" => cmd_pwd(cwd),
-        "uptime" => cmd_uptime(),
-        "info" => cmd_info(),
-        "grep" => cmd_grep(args, cwd, pipe_input),
-        "wc" => cmd_wc(args, cwd, pipe_input),
-        "cp" => cmd_cp(args, cwd),
-        "mv" => cmd_mv(args, cwd),
-        "hexdump" => cmd_hexdump(args, cwd),
-        "save" => cmd_save(),
-        "load" => cmd_load(cwd),
-        "ps" => cmd_ps(),
-        "spawn" => cmd_spawn(args),
-        "kill" => cmd_kill(args),
-        "exec" => cmd_exec(args, cwd),
-        "fatls" => cmd_fatls(),
-        "env" => cmd_env(),
-        "export" => cmd_export(args),
-        "head" => cmd_head(args, cwd, pipe_input),
-        "tail" => cmd_tail(args, cwd, pipe_input),
-        "sort" => cmd_sort(args, cwd, pipe_input),
-        "uniq" => cmd_uniq(pipe_input),
-        "keymap" => cmd_keymap(args),
-        _ => format!("Nieznana komenda: '{}'. Wpisz 'help' aby zobaczyc liste komend.", cmd),
+        "clear" => { crate::drivers::vga::clear_screen(); return String::new() }
+        "cd" => { cmd_cd(args, cwd); return String::new() }
+        "load" => { return cmd_load(cwd) }
+        _ => {}
     }
+
+    // Look up in command table
+    for entry in COMMAND_TABLE {
+        if entry.name == cmd {
+            if let Some(handler) = entry.handler {
+                return handler(args, cwd, pipe_input);
+            }
+        }
+    }
+
+    format!("Nieznana komenda: '{}'. Wpisz 'help' aby zobaczyc liste komend.", cmd)
 }
 
 fn cmd_fatls() -> String {
@@ -52,45 +154,15 @@ fn cmd_fatls() -> String {
     for f in files {
         s.push_str(&format!("  {}\n", f));
     }
-    if s.ends_with('\n') { s.pop(); }
+    trim_trailing_newline(&mut s);
     s
 }
 
 fn cmd_help() -> String {
-    let mut s = String::new();
-    s.push_str("Dostepne komendy:\n");
-    s.push_str("  help              - Wyswietl te pomoc\n");
-    s.push_str("  echo <tekst>      - Wyswietl tekst\n");
-    s.push_str("  clear             - Wyczysc ekran\n");
-    s.push_str("  ls                - Lista plikow i katalogow\n");
-    s.push_str("  cat <plik>        - Wyswietl zawartosc pliku\n");
-    s.push_str("  touch <plik>      - Utworz pusty plik\n");
-    s.push_str("  write <plik> <t>  - Zapisz tekst do pliku\n");
-    s.push_str("  rm <nazwa>        - Usun plik lub pusty katalog\n");
-    s.push_str("  mkdir <nazwa>     - Utworz katalog\n");
-    s.push_str("  cd <katalog>      - Zmien katalog (cd .. / cd /)\n");
-    s.push_str("  pwd               - Wyswietl biezacy katalog\n");
-    s.push_str("  grep <wz> <plik>  - Szukaj wzorca w pliku\n");
-    s.push_str("  wc [plik]         - Policz linie/slowa/bajty\n");
-    s.push_str("  cp <src> <dst>    - Kopiuj plik\n");
-    s.push_str("  mv <src> <dst>    - Przenies/zmien nazwe pliku\n");
-    s.push_str("  hexdump <plik>    - Zrzut szesnastkowy pliku\n");
-    s.push_str("  head [-n N] [plik]- Pokaz pierwszych N linii\n");
-    s.push_str("  tail [-n N] [plik]- Pokaz ostatnich N linii\n");
-    s.push_str("  sort [plik]       - Sortuj linie\n");
-    s.push_str("  uniq              - Usun powtorzenia (pipe)\n");
-    s.push_str("  save              - Zapisz FS na dysk ATA\n");
-    s.push_str("  load              - Wczytaj FS z dysku ATA\n");
-    s.push_str("  uptime            - Czas dzialania systemu\n");
-    s.push_str("  info              - Informacje systemowe\n");
-    s.push_str("  ps                - Lista procesow/taskow\n");
-    s.push_str("  spawn <nazwa>     - Uruchom demo task\n");
-    s.push_str("  kill <id>         - Zakoncz task o podanym ID\n");
-    s.push_str("  exec <program>    - Uruchom program uzytkownika\n");
-    s.push_str("  env               - Pokaz zmienne srodowiskowe\n");
-    s.push_str("  export K=V        - Ustaw zmienna srodowiskowa\n");
-    s.push_str("  fatls             - Lista plikow FAT32\n");
-    s.push_str("  keymap [layout]   - Pokaz/zmien layout klawiatury\n");
+    let mut s = String::from("Dostepne komendy:\n");
+    for entry in COMMAND_TABLE {
+        s.push_str(&format!("  {:16}- {}\n", entry.name, entry.help));
+    }
     s.push_str("Pipe: cmd1 | cmd2   Redirect: cmd > plik, >> plik, < plik");
     s
 }
@@ -114,7 +186,7 @@ fn cmd_ls(cwd: &[String]) -> String {
                     s.push_str(&format!("  {} ({} bajtow)\n", entry.name, entry.size));
                 }
             }
-            if s.ends_with('\n') { s.pop(); }
+            trim_trailing_newline(&mut s);
             s
         }
         None => String::from("Katalog nie istnieje."),
@@ -265,18 +337,9 @@ fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         None => return String::from("Uzycie: grep <wzorzec> [plik]"),
     };
 
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else {
-        let filename = match parts.get(1) {
-            Some(f) => *f,
-            None => return String::from("Uzycie: grep <wzorzec> <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(cwd, filename) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", filename),
-        }
+    let text = match read_text_input(pipe_input, parts.get(1).copied(), cwd, "Uzycie: grep <wzorzec> <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let mut result = String::new();
@@ -286,7 +349,7 @@ fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
             result.push('\n');
         }
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     if result.is_empty() {
         format!("Brak wynikow dla '{}'.", pattern)
     } else {
@@ -295,18 +358,9 @@ fn cmd_grep(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
 }
 
 fn cmd_wc(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else {
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: wc <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(cwd, name) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", name),
-        }
+    let text = match read_text_input(pipe_input, args.split_whitespace().next(), cwd, "Uzycie: wc <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let bytes = text.len();
@@ -388,7 +442,7 @@ fn cmd_hexdump(args: &str, cwd: &[String]) -> String {
                 }
                 s.push_str("|\n");
             }
-            if s.ends_with('\n') { s.pop(); }
+            trim_trailing_newline(&mut s);
             s
         }
         None => format!("Plik '{}' nie istnieje.", name),
@@ -500,7 +554,7 @@ fn cmd_ps() -> String {
             s.push_str(&format!("  {:3} {}  {}\n", task.id.0, state_str, task.name));
         }
     });
-    if s.ends_with('\n') { s.pop(); }
+    trim_trailing_newline(&mut s);
     s
 }
 
@@ -691,7 +745,7 @@ fn cmd_env() -> String {
     for (key, value) in env.iter() {
         s.push_str(&format!("{}={}\n", key, value));
     }
-    if s.ends_with('\n') { s.pop(); }
+    trim_trailing_newline(&mut s);
     s
 }
 
@@ -719,33 +773,10 @@ fn cmd_export(args: &str) -> String {
 // --- Extra pipe-friendly commands ---
 
 fn cmd_head(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    let mut n: usize = 10;
-    let mut file_arg: Option<&str> = None;
-
-    let mut i = 0;
-    while i < parts.len() {
-        if parts[i] == "-n" {
-            if let Some(num_str) = parts.get(i + 1) {
-                n = num_str.parse().unwrap_or(10);
-                i += 2;
-                continue;
-            }
-        }
-        file_arg = Some(parts[i]);
-        i += 1;
-    }
-
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else if let Some(filename) = file_arg {
-        let fs = FS.lock();
-        match fs.read(cwd, filename) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", filename),
-        }
-    } else {
-        return String::from("Uzycie: head [-n N] <plik>");
+    let (n, file_arg) = parse_n_args(args, 10);
+    let text = match read_text_input(pipe_input, file_arg, cwd, "Uzycie: head [-n N] <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let mut result = String::new();
@@ -753,38 +784,15 @@ fn cmd_head(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         result.push_str(line);
         result.push('\n');
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
 fn cmd_tail(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let parts: Vec<&str> = args.split_whitespace().collect();
-    let mut n: usize = 10;
-    let mut file_arg: Option<&str> = None;
-
-    let mut i = 0;
-    while i < parts.len() {
-        if parts[i] == "-n" {
-            if let Some(num_str) = parts.get(i + 1) {
-                n = num_str.parse().unwrap_or(10);
-                i += 2;
-                continue;
-            }
-        }
-        file_arg = Some(parts[i]);
-        i += 1;
-    }
-
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else if let Some(filename) = file_arg {
-        let fs = FS.lock();
-        match fs.read(cwd, filename) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", filename),
-        }
-    } else {
-        return String::from("Uzycie: tail [-n N] <plik>");
+    let (n, file_arg) = parse_n_args(args, 10);
+    let text = match read_text_input(pipe_input, file_arg, cwd, "Uzycie: tail [-n N] <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let all_lines: Vec<&str> = text.lines().collect();
@@ -794,23 +802,14 @@ fn cmd_tail(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         result.push_str(line);
         result.push('\n');
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
 fn cmd_sort(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
-    let text = if let Some(input) = pipe_input {
-        String::from(input)
-    } else {
-        let name = match args.split_whitespace().next() {
-            Some(n) => n,
-            None => return String::from("Uzycie: sort <plik>"),
-        };
-        let fs = FS.lock();
-        match fs.read(cwd, name) {
-            Some(data) => String::from(core::str::from_utf8(data).unwrap_or("")),
-            None => return format!("Plik '{}' nie istnieje.", name),
-        }
+    let text = match read_text_input(pipe_input, args.split_whitespace().next(), cwd, "Uzycie: sort <plik>") {
+        Ok(t) => t,
+        Err(e) => return e,
     };
 
     let mut lines: Vec<&str> = text.lines().collect();
@@ -820,7 +819,7 @@ fn cmd_sort(args: &str, cwd: &[String], pipe_input: Option<&str>) -> String {
         result.push_str(line);
         result.push('\n');
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
 
@@ -861,6 +860,6 @@ fn cmd_uniq(pipe_input: Option<&str>) -> String {
             prev = Some(line);
         }
     }
-    if result.ends_with('\n') { result.pop(); }
+    trim_trailing_newline(&mut result);
     result
 }
